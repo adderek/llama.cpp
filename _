@@ -1,0 +1,31 @@
+#!/bin/bash
+rm -rf build
+mkdir build
+cd build
+#export LLAMA_HIPBLAS=1
+#cmake .. -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=ON -DLLAMA_HIPBLAS=1
+#cmake --build . --config Release -j$(nproc)
+
+export ROCM_PATH=/opt/rocm
+export HIP_PATH=/opt/rocm
+
+cmake .. \
+  -DGGML_HIP=ON \
+  -DAMDGPU_TARGETS=gfx1100 \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMA_BUILD_SERVER=ON \
+  -DLLAMA_CURL=ON \
+  -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/hip;/opt/rocm/lib/cmake" \
+  -DHIP_ROOT_DIR=/opt/rocm \
+  -DROCM_PATH=/opt/rocm \
+  -DHIP_PATH=/opt/rocm \
+  -DCMAKE_HIP_ARCHITECTURES="gfx1100" \
+  -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600"
+
+cmake --build . --config Release -j$(nproc)
+
+# Archive binaries for quick rollback
+ARCHIVE_DIR=~/src/llama.cpp/bin/GPU/ROCm-turboquant/$(date +%Y%m%d%H%M%S)
+mkdir -p "$ARCHIVE_DIR"
+cp bin/llama-server bin/lib*.so* "$ARCHIVE_DIR/"
+echo "Archived to $ARCHIVE_DIR"
