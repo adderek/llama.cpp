@@ -2233,10 +2233,8 @@ extern "C" {
         GGML_SCALE_MODE_BILINEAR = 1,
         GGML_SCALE_MODE_BICUBIC  = 2,
 
-        GGML_SCALE_MODE_COUNT
-    };
+        GGML_SCALE_MODE_COUNT,
 
-    enum ggml_scale_flag {
         GGML_SCALE_FLAG_ALIGN_CORNERS = (1 << 8),
         GGML_SCALE_FLAG_ANTIALIAS     = (1 << 9),
     };
@@ -2270,7 +2268,7 @@ extern "C" {
             int64_t               ne1,
             int64_t               ne2,
             int64_t               ne3,
-            uint32_t              mode); // ggml_scale_mode [ | ggml_scale_flag...]
+            uint32_t              mode); // ggml_scale_mode [ | GGML_SCALE_FLAG_*]
 
     // pad each dimension with zeros: [x, ..., x] -> [x, ..., x, 0, ..., 0]
     GGML_API struct ggml_tensor * ggml_pad(

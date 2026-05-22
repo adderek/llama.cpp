@@ -5174,7 +5174,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_device_buffer_from_host_ptr(
     err = cudaHostGetDevicePointer(&dev_ptr, ptr, 0);
     if (err != cudaSuccess) {
         (void)cudaGetLastError();
-        cudaHostUnregister(ptr);
+        (void)cudaHostUnregister(ptr);
         GGML_LOG_ERROR("%s: cudaHostGetDevicePointer failed: %s\n", __func__, cudaGetErrorString(err));
         return nullptr;
     }

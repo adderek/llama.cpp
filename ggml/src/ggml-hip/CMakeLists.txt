@@ -96,7 +96,9 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
+        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu
+        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q8_0.cu)
 endif()
 
 list(APPEND GGML_SOURCES_ROCM "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-turbo-quant-hip.hip")
@@ -105,6 +107,9 @@ ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
                         )
+
+# -mllvm flags are compile-only; suppress spurious linker-phase warning
+target_link_options(ggml-hip PRIVATE -Wno-unused-command-line-argument)
 
 # TODO: do not use CUDA definitions for HIP
 if (NOT GGML_BACKEND_DL)

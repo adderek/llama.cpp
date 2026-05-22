@@ -2205,8 +2205,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Iterate and write all the keys first, each row is a cell
     // Get whole range at a time
     for (const auto & layer : layers) {
-        const uint32_t il = layer.il;
-
         auto * k = layer.k_stream[cr.strm];
 
         // Use actual tensor width (may be padded for turbo types: e.g. 576→640)
@@ -2230,8 +2228,6 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
     if (!v_trans) {
         for (const auto & layer : layers) {
-            const uint32_t il = layer.il;
-
             auto * v = layer.v_stream[cr.strm];
             if (!v) {
                 continue;

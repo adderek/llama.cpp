@@ -274,15 +274,15 @@ void ggml_cuda_mul_mat_vec_tq(ggml_backend_cuda_context & ctx,
         static size_t  d_act_buf_size = 0;
 
         cudaStreamCaptureStatus capture_status;
-        cudaStreamIsCapturing(stream, &capture_status);
+        (void)cudaStreamIsCapturing(stream, &capture_status);
 
         if (capture_status != cudaStreamCaptureStatusNone) {
             GGML_ASSERT(d_act_buf != nullptr && d_act_buf_size >= shmem_needed &&
                          "TQ scratch buffer not pre-allocated before graph capture");
         } else {
             if (shmem_needed > d_act_buf_size) {
-                if (d_act_buf) cudaFree(d_act_buf);
-                cudaMalloc(&d_act_buf, shmem_needed);
+                if (d_act_buf) (void)cudaFree(d_act_buf);
+                (void)cudaMalloc(&d_act_buf, shmem_needed);
                 d_act_buf_size = shmem_needed;
             }
         }
