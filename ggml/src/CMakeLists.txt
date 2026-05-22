@@ -3,6 +3,7 @@ include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
+
 # enable libstdc++ assertions for debug builds
 if (CMAKE_SYSTEM_NAME MATCHES "Linux")
     add_compile_definitions($<$<CONFIG:Debug>:_GLIBCXX_ASSERTIONS>)
@@ -208,6 +209,7 @@ add_library(ggml-base
             ggml-quants.h
             ggml-turbo-quant.c
             gguf.cpp)
+
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}

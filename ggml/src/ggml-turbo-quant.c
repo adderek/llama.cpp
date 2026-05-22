@@ -17,6 +17,12 @@
 #include <stdlib.h>
 
 #ifndef M_PI
+
+/* HIP/ROCm integration */
+#ifdef GGML_USE_HIP
+extern void turbo_bgs_hip_wrapper(const float* global_block, float* global_out, int d, int batch_size);
+#endif
+
 #define M_PI 3.14159265358979323846
 #endif
 
@@ -142,7 +148,7 @@ static void turbo_init_qjl(void) {
 
 /* ---------- helper: matrix-vector multiply ---------- */
 
-static void matvec(const float * M, const float * x, float * y, int d) {
+static void matvec_ref(const float * M, const float * x, float * y, int d) {
     /* y = M @ x, M is row-major d×d */
     for (int i = 0; i < d; i++) {
         float sum = 0.0f;
@@ -151,6 +157,41 @@ static void matvec(const float * M, const float * x, float * y, int d) {
         }
         y[i] = sum;
     }
+}
+
+#if defined(__AVX2__)
+static void matvec_avx2(const float * M, const float * x, float * y, int d) {
+    for (int i = 0; i < d; i++) {
+        __m256 sum_vec = _mm256_setzero_ps();
+        int j = 0;
+        for (; j <= d - 8; j += 8) {
+            __m256 m_vec = _mm256_loadu_ps(&M[i * d + j]);
+            __m256 x_vec = _mm256_loadu_ps(&x[j]);
+            sum_vec = _mm256_fmadd_ps(m_vec, x_vec, sum_vec);
+        }
+
+        // Horizontal sum of sum_vec
+        float temp[8];
+        _mm256_storeu_ps(temp, sum_vec);
+        float sum = temp[0] + temp[1] + temp[2] + temp[3] + temp[4] + temp[5] + temp[6] + temp[7];
+
+        // Tail handling
+        for (; j < d; j++) {
+            sum += M[i * d + j] * x[j];
+        }
+        y[i] = sum;
+    }
+}
+#endif
+
+static void matvec(const float * M, const float * x, float * y, int d) {
+#if defined(__AVX2__)
+    // In a real production environment, we would check CPU features at runtime.
+    // For this implementation, we assume AVX2 is available if compiled with it.
+    matvec_avx2(M, x, y, d);
+#else
+    matvec_ref(M, x, y, d);
+#endif
 }
 
 /* ---------- nearest centroid ---------- */
@@ -323,6 +364,15 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     assert(n_per_row % QK_TURBO3 == 0);
 
     size_t row_size = (n_per_row / QK_TURBO3) * sizeof(block_turbo3_0);
+
+#ifdef GGML_USE_HIP
+    // HIP implementation: Batch all rows into one large call if possible, 
+    // but for now, we follow the row-wise pattern or dispatch the whole block.
+    // The HIP kernel expects (global_block, global_out, d, batch_size).
+    // We'll treat the whole thing as one batch of 'nrows' rows.
+    turbo_bgs_hip_wrapper(src, (float *)dst, QK_TURBO3, nrows);
+    return nrows * row_size;
+#else
     for (int64_t row = 0; row < nrows; row++) {
         quantize_row_turbo3_0_ref(
             src + row * n_per_row,
@@ -331,6 +381,7 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
         );
     }
     return nrows * row_size;
+#endif
 }
 
 /* ---------- TURBO2_0: 2-bit PolarQuant (no QJL) ---------- */

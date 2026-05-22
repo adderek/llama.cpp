@@ -99,6 +99,8 @@ else()
         ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu)
 endif()
 
+list(APPEND GGML_SOURCES_ROCM "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-turbo-quant-hip.hip")
+
 ggml_add_backend_library(ggml-hip
                          ${GGML_HEADERS_ROCM}
                          ${GGML_SOURCES_ROCM}
