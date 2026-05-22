@@ -1,147 +1,191 @@
 /**
  * @file ggml-turbo-quant-hip.hip
- * @brief High-performance HIP implementation of Block-Gram-Schmidt for RDNA3.
- * 
- * Target: AMD RDNA3 (RX 7000 series)
- * Optimization: LDS Bank Conflict Avoidance, Wavefront-level Parallelism, FMA.
+ * @brief HIP implementation of TURBO3_0 quantization for RDNA3.
+ *
+ * Quantizes one 128-float row into one block_turbo3_0 (50 bytes):
+ *   L2-normalize → WHT (s1, butterfly, inv_sqrt*s2) → 3-bit centroid → pack qs/signs/norm
+ *
+ * Layout of block_turbo3_0 in memory:
+ *   [ggml_half norm (2B)] [qs[32] (32B)] [signs[16] (16B)] = 50 bytes total
  */
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <math.h>
 
-// Stałe dopasowane do architektury RDNA3 (Wavefront size = 32)
-#define B_SIZE 32
-#define D_SIZE 128
-#define L_PAD 33 // Padding dla uniknięcia bank conflicts w LDS (stride 33)
-#define EPSILON 1e-10f
+#define TURBO3_D            128
+#define TURBO3_QS_BYTES      32   /* 128/4 */
+#define TURBO3_SIGNS_BYTES   16   /* 128/8 */
+#define TURBO3_BLOCK_BYTES   50   /* 2 + 32 + 16 */
 
-/**
- * @brief Core Kernel: Parallel Block-Gram-Schmidt
- * 
- * @param global_block Input matrix V (B x D) in VRAM
- * @param global_out   Output matrix V' (B x D) in VRAM
- * @param d            Dimension of vector (D)
- */
-__global__ void turbo_bgs_kernel_rdna3(const float* __restrict__ global_block, 
-                                       float* __restrict__ global_out, 
-                                       int d) {
-    // 1. Deklaracja pamięci lokalnej (LDS)
-    // lds_block: [32][128] -> 16 KB
-    __shared__ float lds_block[B_SIZE * D_SIZE];
-    // lds_gram: [32][33] -> 4 KB (z paddingiem dla bank conflicts)
-    __shared__ float lds_gram[B_SIZE * L_PAD];
-    // lds_out: [32][128] -> 16 KB (do transformacji wektorów)
-    __shared__ float lds_out[B_SIZE * D_SIZE];
+/* WHT sign arrays — must match CPU (turbo_cpu_s1/s2 in ggml-turbo-quant.c, seed=42) */
+__device__ __constant__ float d_s1[128] = {
+    -1, 1, 1,-1,-1, 1,-1, 1,-1,-1, 1, 1, 1, 1, 1, 1, 1,-1, 1,-1, 1,-1,-1, 1, 1, 1,-1, 1, 1,-1,-1,-1,
+    -1, 1, 1,-1, 1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1, 1, 1, 1,-1,-1,-1,-1,-1, 1,-1, 1, 1, 1, 1,-1, 1,
+    -1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1, 1,-1,-1, 1, 1, 1,-1,-1, 1, 1,-1, 1, 1,-1, 1,-1,
+    -1, 1, 1,-1, 1,-1, 1,-1, 1, 1, 1, 1,-1, 1,-1, 1, 1,-1, 1, 1,-1,-1,-1,-1,-1, 1, 1,-1, 1, 1,-1, 1
+};
 
-    const int tid = hipThreadIdx_x; // ID wątku wewnątrz wavefrontu (0-31)
-    const int offset = hipBlockIdx_x * B_SIZE; // base vector index for this block
+__device__ __constant__ float d_s2[128] = {
+     1, 1, 1, 1,-1, 1, 1,-1, 1,-1,-1,-1, 1,-1,-1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1,-1, 1, 1, 1,
+     1, 1,-1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1, 1,-1, 1,-1, 1, 1, 1,-1,-1, 1,-1,-1,-1,-1,-1,-1, 1, 1,
+     1,-1, 1,-1,-1,-1,-1, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1, 1, 1,-1, 1,-1,-1,-1,-1, 1,-1,-1, 1,-1,
+     1,-1, 1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1,-1, 1,-1, 1,-1, 1, 1,-1, 1,-1, 1,-1,-1,-1,-1,-1, 1,-1
+};
 
-    // --- FAZA 1: Ładowanie danych i obliczanie Macierzy Grama ---
+/* 3-bit Lloyd-Max centroids for N(0, 1/128) — must match CPU CENTROIDS_3BIT */
+__device__ __constant__ float d_centroids3[8] = {
+    -0.190685f, -0.117832f, -0.065717f, -0.021460f,
+     0.021460f,  0.065717f,  0.117832f,  0.190685f
+};
 
-    // Coalesced Load: Każdy wątek ładuje swój wektor do LDS
-    for (int i = tid; i < d; i += B_SIZE) {
-        lds_block[tid * d + i] = global_block[(offset + tid) * d + i];
-    }
-    __syncwarp(); 
-
-    // Obliczanie G[i][j] = V[i] . V[j]
-    // Każdy wątek i oblicza swój wiersz w macierzy Grama
-    for (int j = 0; j < B_SIZE; ++j) {
-        float dot = 0.0f;
-        // Optymalizacja: Wykorzystanie FMA (Fused Multiply-Add) w pętli
-        #pragma unroll
-        for (int k = 0; k < d; ++k) {
-            dot += lds_block[tid * d + k] * lds_block[j * d + k];
-        }
-        lds_gram[tid * L_PAD + j] = dot;
-    }
-    __syncwarp(); // Wszystkie elementy G muszą być gotowe w LDS
-
-    // --- FAZA 2: Parallel Cholesky Decomposition (In-place w LDS) ---
-    // Rozwiązujemy G = LL^T
-
-    for (int i = 0; i < B_SIZE; ++i) {
-        // Krok 2.1: Oblicz element przekątnej L[i][i]
-        if (tid == i) {
-            float sum_sq = 0.0f;
-            for (int k = 0; k < i; ++k) {
-                float L_ik = lds_gram[i * L_PAD + k];
-                sum_sq += L_ik * L_ik;
-            }
-            float G_ii = lds_gram[i * L_PAD + i];
-            lds_gram[i * L_PAD + i] = sqrtf(fmaxf(G_ii - sum_sq, EPSILON));
-        }
-        
-        // Synchronizacja wavefrontu: wszystkie wątki muszą widzieć L[i][i]
-        __syncwarp();
-
-        // Krok 2.2: Oblicz elementy pod przekątną L[j][i] dla j > i
-        if (tid > i) {
-            float sum_prod = 0.0f;
-            for (int k = 0; k < i; ++k) {
-                // L[j][k] i L[i][k] są już obliczone w poprzednich iteracjach
-                sum_prod += lds_gram[tid * L_PAD + k] * lds_gram[i * L_PAD + k];
-            }
-            float L_ii = lds_gram[i * L_PAD + i];
-            lds_gram[tid * L_PAD + i] = (lds_gram[tid * L_PAD + i] - sum_prod) / L_ii;
-        }
-        
-        // Synchronizacja: kolumna i musi być gotowa przed przejściem do i+1
-        __syncwarp();
-    }
-
-    // --- FAZA 3: Transformacja Wektorów (V' = V - sum_{j<i} L_ij * V'_j) ---
-    
-    // Kopiujemy wektory wejściowe do lds_out, aby nie niszczyć lds_block (używanego w Fazie 1/2)
-    for (int i = tid; i < d; i += B_SIZE) {
-        lds_out[tid * d + i] = lds_block[tid * d + i];
-    }
-    __syncwarp();
-
-    for (int i = 0; i < B_SIZE; ++i) {
-        // Każdy wątek i wykonuje projekcję dla swojego wektora
-        for (int j = 0; j < i; ++j) {
-            float L_ij = lds_gram[i * L_PAD + j];
-            // Wektor V'_j jest już zortogonalizowany i znajduje się w lds_out
-            #pragma unroll
-            for (int k = 0; k < d; ++k) {
-                lds_out[i * d + k] -= L_ij * lds_out[j * d + k];
-            }
-        }
-        
-        // Normalizacja wektora V'_i
-        float norm_sq = 0.0f;
-        for (int k = 0; k < d; ++k) {
-            norm_sq += lds_out[i * d + k] * lds_out[i * d + k];
-        }
-        float inv_norm = 1.0f / sqrtf(fmaxf(norm_sq, EPSILON));
-        for (int k = 0; k < d; ++k) {
-            lds_out[i * d + k] *= inv_norm;
-        }
-        
-        // Synchronizacja: wektor V'_i musi być gotowy dla kolejnych wektorów (j > i)
-        __syncwarp();
-    }
-
-    // --- FAZA 4: Zapis do pamięci globalnej ---
-    for (int i = tid; i < d; i += B_SIZE) {
-        global_out[(offset + tid) * d + i] = lds_out[tid * d + i];
-    }
+__device__ static inline int nearest_centroid_3bit_dev(float val) {
+    if (val < -0.154259f) return 0;
+    if (val < -0.091775f) return 1;
+    if (val < -0.043589f) return 2;
+    if (val <  0.000000f) return 3;
+    if (val <  0.043589f) return 4;
+    if (val <  0.091775f) return 5;
+    if (val <  0.154259f) return 6;
+    return 7;
 }
 
 /**
- * @brief C-compatible wrapper for HIP kernel.
- * 
- * @param global_block Pointer to input matrix in VRAM
- * @param global_out   Pointer to output matrix in VRAM
- * @param d            Vector dimension
- * @param batch_size   Number of blocks (each block is B_SIZE vectors)
+ * One block per input row, 32 threads (one RDNA3 wavefront) per block.
+ * Quantizes 128 floats into one block_turbo3_0.
  */
-extern "C" void turbo_bgs_hip_wrapper(const float* global_block, float* global_out, int d, int batch_size) {
-    // Grid: jeden blok na każdy zestaw 32 wektorów
-    dim3 grid(batch_size); 
-    // Block: jeden wavefront (32 wątki)
-    dim3 block(B_SIZE); 
+__global__ void turbo3_quantize_kernel_rdna3(
+        const float * __restrict__ src,
+        uint8_t     * __restrict__ dst,
+        int nrows) {
 
-    hipLaunchKernelGGL(turbo_bgs_kernel_rdna3, grid, block, 0, 0, global_block, global_out, d);
+    const int row = hipBlockIdx_x;
+    const int tid = hipThreadIdx_x;  /* 0..31 */
+    if (row >= nrows) return;
+
+    __shared__ float buf[TURBO3_D];
+
+    /* Coalesced load: thread tid owns indices tid, tid+32, tid+64, tid+96 */
+    const float * row_in = src + (size_t)row * TURBO3_D;
+    buf[tid]      = row_in[tid];
+    buf[tid + 32] = row_in[tid + 32];
+    buf[tid + 64] = row_in[tid + 64];
+    buf[tid + 96] = row_in[tid + 96];
+    __syncwarp();
+
+    /* 1. L2 norm over all 128 elements via warp reduction */
+    float norm_sq = buf[tid]      * buf[tid]
+                  + buf[tid + 32] * buf[tid + 32]
+                  + buf[tid + 64] * buf[tid + 64]
+                  + buf[tid + 96] * buf[tid + 96];
+    for (int mask = 16; mask > 0; mask >>= 1)
+        norm_sq += __shfl_xor(norm_sq, mask);
+    const float grp_norm = sqrtf(norm_sq);
+    const float inv_norm = (grp_norm > 1e-10f) ? 1.0f / grp_norm : 0.0f;
+
+    /* 2. Normalize in-place */
+    buf[tid]      *= inv_norm;
+    buf[tid + 32] *= inv_norm;
+    buf[tid + 64] *= inv_norm;
+    buf[tid + 96] *= inv_norm;
+    __syncwarp();
+
+    /* 3. WHT — apply s1 signs */
+    buf[tid]      *= d_s1[tid];
+    buf[tid + 32] *= d_s1[tid + 32];
+    buf[tid + 64] *= d_s1[tid + 64];
+    buf[tid + 96] *= d_s1[tid + 96];
+    __syncwarp();
+
+    /* 4. WHT — 7-stage butterfly (size 128) */
+    for (int h = 1; h < TURBO3_D; h <<= 1) {
+        /*
+         * 64 pairs per stage; thread tid handles pair tid and pair tid+32.
+         * Pair p maps to indices: i = (p/h)*2h + (p%h), j = i+h.
+         * No two pairs within a stage share an index, so no write conflicts.
+         */
+        for (int p = tid; p < 64; p += 32) {
+            int i = (p / h) * (2 * h) + (p % h);
+            int j = i + h;
+            float a = buf[i], b = buf[j];
+            buf[i] = a + b;
+            buf[j] = a - b;
+        }
+        __syncwarp();
+    }
+
+    /* 5. WHT — normalize and apply s2 signs */
+    const float inv_sqrt128 = 0.08838834764831845f;  /* 1/sqrt(128) */
+    buf[tid]      *= inv_sqrt128 * d_s2[tid];
+    buf[tid + 32] *= inv_sqrt128 * d_s2[tid + 32];
+    buf[tid + 64] *= inv_sqrt128 * d_s2[tid + 64];
+    buf[tid + 96] *= inv_sqrt128 * d_s2[tid + 96];
+    __syncwarp();
+
+    /*
+     * 6. Quantize: thread tid handles 4 consecutive elements [tid*4 .. tid*4+3].
+     *    These 4 elements pack into exactly one qs byte (byte index = tid).
+     *    Sign bits for those 4 elements go into half of signs byte tid/2.
+     */
+    uint8_t my_qs = 0;
+    uint8_t my_sign_nibble = 0;
+    float   recon_sq_partial = 0.0f;
+
+    for (int k = 0; k < 4; k++) {
+        float v   = buf[tid * 4 + k];
+        int   idx = nearest_centroid_3bit_dev(v);
+        my_qs |= (uint8_t)((idx & 0x3) << (k * 2));
+        if (idx & 0x4) my_sign_nibble |= (uint8_t)(1 << k);
+        float c = d_centroids3[idx];
+        recon_sq_partial += c * c;
+    }
+
+    /* 7. Warp-reduce reconstruction norm squared */
+    float recon_sq = recon_sq_partial;
+    for (int mask = 16; mask > 0; mask >>= 1)
+        recon_sq += __shfl_xor(recon_sq, mask);
+
+    /* 8. Corrected norm = grp_norm / recon_norm (matches CPU quantize_row_turbo3_0_ref) */
+    const float recon_norm = sqrtf(recon_sq);
+    const float corrected  = (recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm;
+
+    /* 9. Write block_turbo3_0 output */
+    uint8_t * blk = dst + (size_t)row * TURBO3_BLOCK_BYTES;
+
+    /* norm (fp16) — thread 0 only */
+    if (tid == 0) {
+        __half h16 = __float2half(corrected);
+        *((uint16_t *)blk) = __half_as_ushort(h16);
+    }
+
+    /* qs[32]: thread tid writes byte tid — no conflicts */
+    blk[2 + tid] = my_qs;
+
+    /*
+     * signs[16]: threads 2k and 2k+1 both contribute to signs byte k.
+     *   Thread 2k  holds bits 0..3 (positions 0..3 in the byte).
+     *   Thread 2k+1 holds bits 0..3, must shift to positions 4..7.
+     * Merge via shfl_xor(lane^1) then even thread writes.
+     */
+    const int    bit_shift     = (tid & 1) * 4;
+    const uint8_t my_shifted   = my_sign_nibble << bit_shift;
+    const uint8_t partner      = (uint8_t)__shfl_xor((int)my_shifted, 1);
+    const uint8_t combined     = my_shifted | partner;
+    if ((tid & 1) == 0) {
+        blk[2 + TURBO3_QS_BYTES + (tid >> 1)] = combined;
+    }
+}
+
+extern "C" void turbo3_0_quantize_hip(const float * src, void * dst, int nrows) {
+    dim3 grid(nrows);
+    dim3 block(32);  /* one RDNA3 wavefront */
+    hipLaunchKernelGGL(turbo3_quantize_kernel_rdna3, grid, block, 0, 0,
+                       src, (uint8_t *)dst, nrows);
+}
+
+/* Keep old name as alias so the call site in ggml-turbo-quant.c continues to compile
+   until it is updated to call turbo3_0_quantize_hip directly. */
+extern "C" void turbo_bgs_hip_wrapper(const float * global_block, float * global_out, int d, int batch_size) {
+    (void)d;  /* always TURBO3_D=128 */
+    turbo3_0_quantize_hip(global_block, global_out, batch_size);
 }

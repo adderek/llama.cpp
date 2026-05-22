@@ -20,7 +20,7 @@
 
 /* HIP/ROCm integration */
 #ifdef GGML_USE_HIP
-extern void turbo_bgs_hip_wrapper(const float* global_block, float* global_out, int d, int batch_size);
+extern void turbo3_0_quantize_hip(const float * src, void * dst, int nrows);
 #endif
 
 #define M_PI 3.14159265358979323846
@@ -370,7 +370,7 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     // but for now, we follow the row-wise pattern or dispatch the whole block.
     // The HIP kernel expects (global_block, global_out, d, batch_size).
     // We'll treat the whole thing as one batch of 'nrows' rows.
-    turbo_bgs_hip_wrapper(src, (float *)dst, QK_TURBO3, nrows);
+    turbo3_0_quantize_hip(src, dst, nrows);
     return nrows * row_size;
 #else
     for (int64_t row = 0; row < nrows; row++) {
