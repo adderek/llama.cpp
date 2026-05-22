@@ -34,12 +34,13 @@ __global__ void turbo_bgs_kernel_rdna3(const float* __restrict__ global_block,
     __shared__ float lds_out[B_SIZE * D_SIZE];
 
     const int tid = hipThreadIdx_x; // ID wątku wewnątrz wavefrontu (0-31)
+    const int offset = hipBlockIdx_x * B_SIZE; // base vector index for this block
 
     // --- FAZA 1: Ładowanie danych i obliczanie Macierzy Grama ---
-    
+
     // Coalesced Load: Każdy wątek ładuje swój wektor do LDS
     for (int i = tid; i < d; i += B_SIZE) {
-        lds_block[tid * d + i] = global_block[tid * d + i];
+        lds_block[tid * d + i] = global_block[(offset + tid) * d + i];
     }
     __syncwarp(); 
 
@@ -124,7 +125,7 @@ __global__ void turbo_bgs_kernel_rdna3(const float* __restrict__ global_block,
 
     // --- FAZA 4: Zapis do pamięci globalnej ---
     for (int i = tid; i < d; i += B_SIZE) {
-        global_out[tid * d + i] = lds_out[tid * d + i];
+        global_out[(offset + tid) * d + i] = lds_out[tid * d + i];
     }
 }
 
