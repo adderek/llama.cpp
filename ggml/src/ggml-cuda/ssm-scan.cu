@@ -1,3 +1,5 @@
+#include "ssm-scan.cuh"
+
 #if (!defined(GGML_USE_MUSA) && (defined(GGML_USE_HIP) || CUDART_VERSION >= 11070))
 #define USE_CUB
 #endif // !defined(GGML_USE_MUSA) && (defined(GGML_USE_HIP) || CUDART_VERSION >= 11070)
@@ -11,8 +13,6 @@
 #   endif
 using namespace cub;
 #endif // USE_CUB
-
-#include "ssm-scan.cuh"
 
 // We would like to keep pragma unroll for cases where L_template is not 0,
 // so we suppress the clang transformation warning.
