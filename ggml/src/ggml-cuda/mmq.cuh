@@ -91,6 +91,8 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
             return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ1_S:
             return MMQ_Q8_1_DS_LAYOUT_DS4;
+        case GGML_TYPE_IQ1_M:
+            return MMQ_Q8_1_DS_LAYOUT_D4;
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
             return MMQ_Q8_1_DS_LAYOUT_D4;

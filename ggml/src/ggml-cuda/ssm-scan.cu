@@ -1,9 +1,14 @@
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#if (!defined(GGML_USE_MUSA) && (defined(GGML_USE_HIP) || CUDART_VERSION >= 11070))
 #define USE_CUB
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && CUDART_VERSION >= 11070
+#endif // !defined(GGML_USE_MUSA) && (defined(GGML_USE_HIP) || CUDART_VERSION >= 11070)
 
 #ifdef USE_CUB
-#include <cub/cub.cuh>
+#   if defined(GGML_USE_HIP)
+#       include <hipcub/hipcub.hpp>
+        namespace cub = hipcub;
+#   else
+#       include <cub/cub.cuh>
+#   endif
 using namespace cub;
 #endif // USE_CUB
 
