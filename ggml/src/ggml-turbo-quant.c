@@ -20,7 +20,9 @@
 
 /* HIP/ROCm integration */
 #ifdef GGML_USE_HIP
+extern void turbo2_0_quantize_hip(const float * src, void * dst, int nrows);
 extern void turbo3_0_quantize_hip(const float * src, void * dst, int nrows);
+extern void turbo4_0_quantize_hip(const float * src, void * dst, int nrows);
 #endif
 
 #define M_PI 3.14159265358979323846
@@ -462,6 +464,12 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     assert(n_per_row % QK_TURBO2 == 0);
 
     size_t row_size = (n_per_row / QK_TURBO2) * sizeof(block_turbo2_0);
+
+#ifdef GGML_USE_HIP
+    assert(n_per_row == QK_TURBO2);  /* HIP kernel handles exactly one 128-elem WHT group per row */
+    turbo2_0_quantize_hip(src, dst, nrows);
+    return nrows * row_size;
+#else
     for (int64_t row = 0; row < nrows; row++) {
         quantize_row_turbo2_0_ref(
             src + row * n_per_row,
@@ -470,6 +478,7 @@ size_t quantize_turbo2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
         );
     }
     return nrows * row_size;
+#endif
 }
 
 /* ---------- TURBO4_0: 3-bit PolarQuant + 1-bit QJL ---------- */
@@ -666,6 +675,12 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
     assert(n_per_row % QK_TURBO4 == 0);
 
     size_t row_size = (n_per_row / QK_TURBO4) * sizeof(block_turbo4_0);
+
+#if defined(GGML_USE_HIP) && TURBO4_USE_4BIT
+    assert(n_per_row == QK_TURBO4);  /* HIP kernel handles exactly one 128-elem WHT group per row */
+    turbo4_0_quantize_hip(src, dst, nrows);
+    return nrows * row_size;
+#else
     for (int64_t row = 0; row < nrows; row++) {
         quantize_row_turbo4_0_ref(
             src + row * n_per_row,
@@ -674,6 +689,7 @@ size_t quantize_turbo4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
         );
     }
     return nrows * row_size;
+#endif
 }
 
 /* ================================================================== */
