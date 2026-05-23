@@ -340,36 +340,51 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 
     // TurboQuant3 KV cache types (always enabled)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
 
     // Mixed turbo3/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
 
     // TurboQuant2 KV cache types (always enabled)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
 
     // Mixed turbo2/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
 
     // Mixed turbo3/turbo2 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0)
 
     // TurboQuant4 KV cache types (always enabled)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
 
     // Mixed turbo4/q8_0 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
 
     // Mixed turbo4/turbo3 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0)
 
     // Mixed turbo4/turbo2 KV cache types
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
     GGML_ABORT("fatal error");
 }
@@ -496,19 +511,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_BF16:
             break;
         case GGML_TYPE_TURBO3_0:
-            // turbo3 VEC kernel instantiated for D in {64, 128, 256}.
+            // turbo3 VEC kernel instantiated for D in {64, 128, 256, 512}.
             if (K->ne[0] % 64 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
         case GGML_TYPE_TURBO2_0:
-            // turbo2 VEC kernel instantiated for D in {64, 128, 256}.
+            // turbo2 VEC kernel instantiated for D in {64, 128, 256, 512}.
             if (K->ne[0] % 64 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
             break;
         case GGML_TYPE_TURBO4_0:
-            // turbo4 VEC kernel instantiated for D in {64, 128, 256}.
+            // turbo4 VEC kernel instantiated for D in {64, 128, 256, 512}.
             if (K->ne[0] % 64 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
@@ -524,6 +539,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+    // Turbo KV types (turbo2/3/4) use a custom packed format that TILE and MMA kernels cannot
+    // decode — those kernels reinterpret K/V bytes as raw f16, producing garbage output.
+    // VEC kernel has correct turbo dequantization.  Force it unconditionally for turbo K/V,
+    // regardless of batch size.  This must be checked before any MMA/TILE dispatch below.
+    {
+        auto is_turbo = [](ggml_type t) {
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
+        };
+        if (is_turbo(K->type) || is_turbo(V->type)) {
+            // VEC supports D in {64,128,256} via can_use_vector_kernel, and D=512 explicitly.
+            if (can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+                return BEST_FATTN_KERNEL_VEC;
+            }
+            return BEST_FATTN_KERNEL_NONE;
+        }
+    }
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
@@ -637,6 +669,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
+
     return BEST_FATTN_KERNEL_TILE;
 }
 
