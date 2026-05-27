@@ -55,6 +55,8 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
         case GGML_TYPE_IQ2_S:   return VDR_IQ2_S_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_XXS: return VDR_IQ3_XXS_Q8_1_MMVQ;
         case GGML_TYPE_IQ3_S:   return VDR_IQ3_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_S:   return VDR_IQ1_S_Q8_1_MMVQ;
+        case GGML_TYPE_IQ1_M:   return VDR_IQ1_M_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_NL:  return VDR_IQ4_NL_Q8_1_MMVQ;
         case GGML_TYPE_IQ4_XS:  return VDR_IQ4_XS_Q8_1_MMVQ;
         default:                return 1;
@@ -341,6 +343,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                 case GGML_TYPE_IQ4_NL:
                 case GGML_TYPE_IQ4_XS:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
                     return 8;
                 default:
                     return 1;
@@ -363,6 +367,8 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
                 case GGML_TYPE_Q6_K:
                     return 2;
                 case GGML_TYPE_IQ4_NL:
+                case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_M:
                     return 8;
                 default:
                     return 1;
