@@ -540,11 +540,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
-    // Turbo KV types (turbo2/3/4) cannot be processed by the TILE kernel (raw f16 reinterpret).
-    // VEC has correct on-the-fly turbo dequantization — optimal for decode (memory-BW bound).
-    // MMA_F16 (via launch_fattn pre-dequant using ggml_get_to_fp16_cuda) is faster for prefill
-    // (compute-bound) when AMD WMMA is available and D<=256 (RDNA3 MMA does not support DKQ>256).
-    // For small batch or non-WMMA paths, fall back to VEC.  Never select TILE for turbo KV.
+    // Turbo KV types (turbo2/3/4) use a custom packed format that TILE and MMA kernels cannot
+    // decode — those kernels reinterpret K/V bytes as raw f16, producing garbage output.
+    // MMA_F16's pre-dequant path also fails: build_attn_mha permutes then transposes V, leaving
+    // V->nb[0] = n_kv_heads * type_size ≠ type_size, which violates the non-contiguous dequant
+    // ASSERT in launch_fattn.  VEC has correct on-the-fly turbo dequantization; use it always.
     {
         auto is_turbo = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
@@ -552,16 +552,6 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         if (is_turbo(K->type) || is_turbo(V->type)) {
             // VEC supports D in {64,128,256} via can_use_vector_kernel, and D=512 explicitly.
             if (can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
-                // Compute effective batch size for the MMA threshold check.
-                const int ncols2_max_t = Q->ne[0] == 320 ? 32 : ((Q->ne[0] == 576 || Q->ne[0] == 192) ? 16 : 8);
-                int gqa_ratio_eff_t = 1;
-                while (gqa_ratio % (2*gqa_ratio_eff_t) == 0 && gqa_ratio_eff_t < ncols2_max_t) {
-                    gqa_ratio_eff_t *= 2;
-                }
-                // Use MMA for large batch on WMMA-capable AMD (D<=256 only; D=512 not supported by RDNA3 MMA).
-                if (amd_wmma_available(cc) && Q->ne[0] <= 256 && Q->ne[1] * gqa_ratio_eff_t > 8) {
-                    return BEST_FATTN_KERNEL_MMA_F16;
-                }
                 return BEST_FATTN_KERNEL_VEC;
             }
             return BEST_FATTN_KERNEL_NONE;

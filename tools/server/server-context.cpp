@@ -1111,10 +1111,12 @@ private:
             }
 
             // thinking is enabled if:
-            // 1. It's not explicitly disabled via --reasoning off
+            // 1. It's explicitly enabled via --reasoning enable (== 1)
             // 2. The chat template supports it
+            // Auto mode (-1) does NOT enable thinking — Qwen3.5/3.6 with enable_thinking=true
+            // routes ALL output to reasoning_content, leaving content empty for agents.
             const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
-            const bool enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
+            const bool enable_thinking = params_base.enable_reasoning == 1 && template_supports_thinking;
             SRV_INF("%s: chat template, thinking = %d\n", __func__, enable_thinking);
 
             chat_params = {
