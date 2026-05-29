@@ -362,6 +362,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
+                case GGML_TYPE_IQ1_M:
+                    // turboquant mmq uses a lossy scale approximation that fails tests at mmq_x=16 (n>=9);
+                    // fall back to hipBLAS dequant for correctness until the implementation is fixed.
+                    return false;
                 default:
                     return true;
             }
