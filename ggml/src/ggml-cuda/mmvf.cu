@@ -229,42 +229,6 @@ static __global__ void mul_mat_vec_f(
 #endif // FP16_AVAILABLE
         }
     } else if constexpr (std::is_same_v<T, nv_bfloat16>) {
-//TODO: add support for ggml_cuda_mad for hip_bfloat162
-#if defined(GGML_USE_HIP)
-        const int * x2 = (const int *) x;
-        const int * gate_x2 = nullptr;
-        if constexpr (has_fusion) {
-            if (use_gate) {
-                gate_x2 = (const int *) gate_x;
-            }
-        }
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-            const int tmpx = x2[col2];
-            int tmpx_gate = 0;
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmpx_gate = gate_x2[col2];
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
-                const float tmpx0 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[0]);
-                const float tmpx1 = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx)[1]);
-                ggml_cuda_mad(sumf[j], tmpx0, tmpy.x);
-                ggml_cuda_mad(sumf[j], tmpx1, tmpy.y);
-
-                if constexpr (has_fusion) {
-                    if (use_gate) {
-                        const float tmpx0_gate = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx_gate)[0]);
-                        const float tmpx1_gate = ggml_cuda_cast<float>(reinterpret_cast<const nv_bfloat16 *>(&tmpx_gate)[1]);
-                        ggml_cuda_mad(sumf_gate[j], tmpx0_gate, tmpy.x);
-                        ggml_cuda_mad(sumf_gate[j], tmpx1_gate, tmpy.y);
-                    }
-                }
-            }
-        }
-#else
         const nv_bfloat162 * x2 = (const nv_bfloat162 *) x;
         const nv_bfloat162 * gate_x2 = nullptr;
         if constexpr (has_fusion) {
@@ -272,29 +236,79 @@ static __global__ void mul_mat_vec_f(
                 gate_x2 = (const nv_bfloat162 *) gate_x;
             }
         }
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
-            const nv_bfloat162 tmpx = x2[col2];
-            nv_bfloat162 tmpx_gate;
-            if constexpr (has_fusion) {
-                if (use_gate) {
-                    tmpx_gate = gate_x2[col2];
-                }
-            }
-#pragma unroll
-            for (int j = 0; j < ncols_dst; ++j) {
-                const float2 tmpy = y2[j*stride_col_y2 + col2];
-                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
-                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
-
+        if constexpr (std::is_same_v<type_acc, float>) {
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const nv_bfloat162 tmpx = x2[col2];
+                nv_bfloat162 tmpx_gate = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
                 if constexpr (has_fusion) {
                     if (use_gate) {
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.x, tmpy.x);
-                        ggml_cuda_mad(sumf_gate[j], tmpx_gate.y, tmpy.y);
+                        tmpx_gate = gate_x2[col2];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    sumf[j] += __bfloat162float(tmpx.x) * tmpy.x;
+                    sumf[j] += __bfloat162float(tmpx.y) * tmpy.y;
+
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            sumf_gate[j] += __bfloat162float(tmpx_gate.x) * tmpy.x;
+                            sumf_gate[j] += __bfloat162float(tmpx_gate.y) * tmpy.y;
+                        }
                     }
                 }
             }
+        } else {
+#ifdef FP16_AVAILABLE
+            // Fast BF16 pair accumulation: convert y to bfloat162 and use native BF16 pair multiply.
+            // Mirrors the half2 fast path for F16. Uses __hmul2/__hadd2 on HIP (RDNA3+), __hmul2 on NVIDIA Ampere+.
+            nv_bfloat162 sumb2[ncols_dst];
+            nv_bfloat162 sumb2_gate[ncols_dst];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumb2[j] = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
+                sumb2_gate[j] = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
+            }
+
+            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+                const nv_bfloat162 tmpx = x2[col2];
+                nv_bfloat162 tmpx_gate = __float22bfloat162_rn(make_float2(0.0f, 0.0f));
+                if constexpr (has_fusion) {
+                    if (use_gate) {
+                        tmpx_gate = gate_x2[col2];
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 tmpy = y2[j*stride_col_y2 + col2];
+                    sumb2[j] += tmpx * __float22bfloat162_rn(tmpy);
+
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            sumb2_gate[j] += tmpx_gate * __float22bfloat162_rn(tmpy);
+                        }
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                sumf[j] = __bfloat162float(sumb2[j].x) + __bfloat162float(sumb2[j].y);
+            }
+
+            if constexpr (has_fusion) {
+                if (use_gate) {
+#pragma unroll
+                    for (int j = 0; j < ncols_dst; ++j) {
+                        sumf_gate[j] = __bfloat162float(sumb2_gate[j].x) + __bfloat162float(sumb2_gate[j].y);
+                    }
+                }
+            }
+#else
+            NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
         }
-#endif
     } else {
         static_assert(std::is_same_v<T, void>, "unsupported type");
     }
@@ -611,6 +625,15 @@ static void mul_mat_vec_f_cuda(
     if constexpr(std::is_same_v<T, half>) {
         if (prec == GGML_PREC_DEFAULT) {
             mul_mat_vec_f_cuda_switch_ncols_dst<T, half>
+                (x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
+                stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            return;
+        }
+    }
+    if constexpr(std::is_same_v<T, nv_bfloat16>) {
+        if (prec == GGML_PREC_DEFAULT) {
+            mul_mat_vec_f_cuda_switch_ncols_dst<T, nv_bfloat16>
                 (x, y, ids, fusion, dst, ncols, nrows, ncols_dst, stride_row, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

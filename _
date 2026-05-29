@@ -9,9 +9,12 @@ cd build
 export ROCM_PATH=/opt/rocm
 export HIP_PATH=/opt/rocm
 
+# -DGGML_HIP_ROCWMMA_FATTN=ON - WMMA czyli grupowanie operacji kernela z wielu w jedną dużą operację aby GPU nie musiało co chwilę uruchamiać nowego kernela
+
 cmake .. \
   -DGGML_HIP=ON \
   -DAMDGPU_TARGETS=gfx1100 \
+  -DGGML_HIP_ROCWMMA_FATTN=ON \
   -DCMAKE_BUILD_TYPE=Release \
   -DLLAMA_BUILD_SERVER=ON \
   -DLLAMA_CURL=ON \

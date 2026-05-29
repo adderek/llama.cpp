@@ -166,7 +166,7 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const 
             return false;
         }
     } else {
-        if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 8) {
+        if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 15) {
             return false;
         } else if (GGML_CUDA_CC_IS_CDNA2(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
             //TODO: truse CDNA2 as CDNA1, tune the perf when CDNA2 is available.
