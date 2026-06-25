@@ -693,7 +693,7 @@ class Gemma4Model(Gemma3Model):
             self.gguf_writer.add_head_count_kv(value_arr)
 
         # handle n_rot differently for global vs swa layers
-        partial_rotary_factor_swa = self.hparams.get("partial_rotary_factor", 1.0)
+        partial_rotary_factor_swa = self.rope_parameters.get("partial_rotary_factor", 1.0)
         n_rot_full = int(head_dim_full) # "proportional" is used, see generate_extra_tensors
         n_rot_swa = int(head_dim_swa * partial_rotary_factor_swa)
         self.gguf_writer.add_rope_dimension_count(n_rot_full)
@@ -783,6 +783,26 @@ class Gemma4UnifiedModel(Gemma4Model):
         suppress_tokens = self._get_suppress_tokens()
         if suppress_tokens is not None:
             self.gguf_writer.add_suppress_tokens(suppress_tokens)
+
+
+@ModelBase.register("Gemma4AssistantForCausalLM", "Gemma4UnifiedAssistantForCausalLM")
+class Gemma4AssistantModel(Gemma4Model):
+    model_arch = gguf.MODEL_ARCH.GEMMA4_ASSISTANT
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+
+        if "masked_embedding" in name:
+            logger.debug(f"Skipping get tensor {name!r} in safetensors so that convert can end normally.")
+            return None
+
+        return super().filter_tensors(item)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_embedding_length_out(self.hparams["backbone_hidden_size"])
+        self.gguf_writer.add_nextn_predict_layers(self.block_count)
 
 
 @ModelBase.register("Gemma4ForConditionalGeneration")
