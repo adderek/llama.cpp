@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <ctime>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -91,13 +92,18 @@ struct common_log_entry {
 
         if (level != GGML_LOG_LEVEL_NONE && level != GGML_LOG_LEVEL_CONT && prefix) {
             if (timestamp) {
-                // [M.s.ms.us]
-                fprintf(fcur, "%s%d.%02d.%03d.%03d%s ",
+                // wall-clock local time [hh:mm:ss.mmm]
+                const std::time_t t_sec = (std::time_t) (timestamp / 1000000);
+                const int         t_ms  = (int) (timestamp / 1000 % 1000);
+                std::tm tm_buf;
+#if defined(_WIN32)
+                localtime_s(&tm_buf, &t_sec);
+#else
+                localtime_r(&t_sec, &tm_buf);
+#endif
+                fprintf(fcur, "%s%02d:%02d:%02d.%03d%s ",
                         g_col[COMMON_LOG_COL_BLUE],
-                        (int) (timestamp / 1000000 / 60),
-                        (int) (timestamp / 1000000 % 60),
-                        (int) (timestamp / 1000 % 1000),
-                        (int) (timestamp % 1000),
+                        tm_buf.tm_hour, tm_buf.tm_min, tm_buf.tm_sec, t_ms,
                         g_col[COMMON_LOG_COL_DEFAULT]);
             }
 
@@ -220,7 +226,8 @@ public:
         entry.prefix = prefix;
         entry.timestamp = 0;
         if (timestamps) {
-            entry.timestamp = t_us() - t_start;
+            // store absolute epoch microseconds so the printer can show wall-clock local time
+            entry.timestamp = t_us();
         }
         entry.is_end = false;
 

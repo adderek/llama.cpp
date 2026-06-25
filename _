@@ -1,29 +1,42 @@
 #!/bin/bash
-rm -rf build
-mkdir build
+set -e
+
+# Pass --clean to force full rebuild from scratch
+if [[ "$1" == "--clean" ]]; then
+    rm -rf build
+fi
+
+mkdir -p build
 cd build
-#export LLAMA_HIPBLAS=1
-#cmake .. -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=ON -DLLAMA_HIPBLAS=1
-#cmake --build . --config Release -j$(nproc)
 
 export ROCM_PATH=/opt/rocm
 export HIP_PATH=/opt/rocm
 
-# -DGGML_HIP_ROCWMMA_FATTN=ON - WMMA czyli grupowanie operacji kernela z wielu w jedną dużą operację aby GPU nie musiało co chwilę uruchamiać nowego kernela
+# ccache: needed for HIP files
+export CCACHE_CPP2=yes
+export CCACHE_NODIRECT=1
 
-cmake .. \
-  -DGGML_HIP=ON \
-  -DAMDGPU_TARGETS=gfx1100 \
-  -DGGML_HIP_ROCWMMA_FATTN=ON \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_BUILD_SERVER=ON \
-  -DLLAMA_CURL=ON \
-  -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/hip;/opt/rocm/lib/cmake" \
-  -DHIP_ROOT_DIR=/opt/rocm \
-  -DROCM_PATH=/opt/rocm \
-  -DHIP_PATH=/opt/rocm \
-  -DCMAKE_HIP_ARCHITECTURES="gfx1100" \
-  -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600"
+# Only run cmake configure if cache missing or --clean was used
+if [[ ! -f CMakeCache.txt ]]; then
+    cmake .. \
+      -G Ninja \
+      -DGGML_HIP=ON \
+      -DAMDGPU_TARGETS=gfx1100 \
+      -DGGML_HIP_ROCWMMA_FATTN=ON \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DLLAMA_BUILD_SERVER=ON \
+      -DLLAMA_CURL=ON \
+      -DGGML_CCACHE=ON \
+      -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_HIP_COMPILER_LAUNCHER=ccache \
+      -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/rocm/hip;/opt/rocm/lib/cmake" \
+      -DHIP_ROOT_DIR=/opt/rocm \
+      -DROCM_PATH=/opt/rocm \
+      -DHIP_PATH=/opt/rocm \
+      -DCMAKE_HIP_ARCHITECTURES="gfx1100" \
+      -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600"
+fi
 
 cmake --build . --config Release -j$(nproc)
 

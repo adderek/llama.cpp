@@ -23,6 +23,16 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <atomic>
+#include <thread>
+#include <chrono>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <fcntl.h>
+#endif
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -36,6 +46,93 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Stall watchdog: optional diagnostic for the rare mid-generation wedge where a
+// slot stops producing tokens and never releases. Enabled via
+// LLAMA_STALL_WATCHDOG_SECS=<seconds>. When a generation is in flight but no
+// decode/token progress happens for that long, it logs and (unless
+// LLAMA_STALL_WATCHDOG_GDB=0) dumps all thread backtraces via gdb. Off by default.
+namespace {
+std::atomic<int64_t> g_stall_last_us{0};
+std::atomic<bool>    g_stall_armed{false};
+
+inline void stall_mark_activity() {
+    g_stall_last_us.store(ggml_time_us(), std::memory_order_relaxed);
+}
+
+#if defined(__linux__)
+void stall_dump_backtrace(int64_t age_ms) {
+    SRV_ERR("stall-watchdog: no progress for %lld ms, dumping backtraces\n", (long long) age_ms);
+
+    const char * gdb_env = getenv("LLAMA_STALL_WATCHDOG_GDB");
+    if (gdb_env && gdb_env[0] == '0') {
+        return;
+    }
+
+    char pidbuf[32];
+    char outbuf[256];
+    snprintf(pidbuf, sizeof(pidbuf), "%d", (int) getpid());
+    snprintf(outbuf, sizeof(outbuf), "stall_bt_%d_%lld.txt", (int) getpid(), (long long) time(nullptr));
+
+    // fork + exec only: no locks touched in the child before execlp.
+    pid_t child = fork();
+    if (child == 0) {
+        int fd = open(outbuf, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+        execlp("gdb", "gdb", "-p", pidbuf, "-batch", "-nx",
+               "-ex", "set debuginfod enabled off",
+               "-ex", "info threads",
+               "-ex", "thread apply all bt", (char *) nullptr);
+        _exit(127);
+    } else if (child > 0) {
+        int status = 0;
+        waitpid(child, &status, 0);
+        SRV_ERR("stall-watchdog: backtrace written to %s\n", outbuf);
+    }
+}
+#else
+void stall_dump_backtrace(int64_t) {}
+#endif
+
+void stall_watchdog_main(int threshold_secs) {
+#if defined(__linux__)
+    // Allow the forked gdb to attach to us under yama ptrace_scope=1.
+    prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+#endif
+    const int64_t threshold_us = (int64_t) threshold_secs * 1000000;
+    bool fired = false;
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!g_stall_armed.load(std::memory_order_relaxed)) { fired = false; continue; }
+        const int64_t last = g_stall_last_us.load(std::memory_order_relaxed);
+        if (last == 0) {
+            continue;
+        }
+        const int64_t age = ggml_time_us() - last;
+        if (age > threshold_us) {
+            if (!fired) {
+                stall_dump_backtrace(age / 1000);
+                fired = true; // one dump per stall episode
+            }
+        } else {
+            fired = false;
+        }
+    }
+}
+
+void stall_watchdog_start() {
+    const char * env = getenv("LLAMA_STALL_WATCHDOG_SECS");
+    if (!env) {
+        return;
+    }
+    const int secs = atoi(env);
+    if (secs <= 0) {
+        return;
+    }
+    SRV_INF("stall-watchdog: enabled, threshold = %d s\n", secs);
+    std::thread(stall_watchdog_main, secs).detach();
+}
+} // namespace
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -69,6 +166,10 @@ enum server_state {
 
 struct server_slot {
     int id;
+
+    // slot occupancy tracking (shared across all slots) for "in use / available" logging
+    static inline int n_slots_total = 0; // total number of slots (-np)
+    static inline int n_slots_busy  = 0; // number of slots currently processing
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -380,6 +481,10 @@ struct server_slot {
 
             state = SLOT_STATE_IDLE;
 
+            if (server_slot::n_slots_busy > 0) {
+                server_slot::n_slots_busy--;
+            }
+
             // do not keep context of the child slots - the parent's context is enough
             if (task->is_child()) {
                 prompt_clear(false);
@@ -615,6 +720,7 @@ struct server_metrics {
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
+        stall_mark_activity();
         n_decode_total++;
         for (const auto & slot : slots) {
             if (slot.is_processing()) {
@@ -1050,6 +1156,9 @@ private:
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
+
+        server_slot::n_slots_total = params_base.n_parallel;
+        server_slot::n_slots_busy  = 0;
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
@@ -1539,6 +1648,8 @@ private:
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
 
+        server_slot::n_slots_busy++;
+
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
@@ -1547,6 +1658,7 @@ private:
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
+        stall_mark_activity();
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
@@ -2383,6 +2495,8 @@ private:
                     break;
                 }
             }
+
+            g_stall_armed.store(!all_idle, std::memory_order_relaxed);
 
             if (all_idle) {
                 SRV_INF("%s", "all slots are idle\n");
@@ -3549,6 +3663,7 @@ bool server_context::load_model(common_params & params) {
 
 void server_context::start_loop() {
     auto & params = impl->params_base;
+    stall_watchdog_start();
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
 }
 
