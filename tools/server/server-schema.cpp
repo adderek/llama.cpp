@@ -190,16 +190,15 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     // Speculative decoding params
     //
 
-    // TODO: to keep things simple, we disable speculative parameter adjustments for now
-#if 0
-    // TODO: for now, be able to adjust only the draft-model based speculative parameters
+    // Allow per-request speculative decoding adjustments (e.g. switch spec type per task).
+    // Only the draft-model based params, ngram sizes, and the spec type are adjustable.
     add((new field_num("speculative.n_max", params.speculative.draft.n_max))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Maximum number of tokens to draft during speculative decoding"));
 
     add((new field_num("speculative.n_min", params.speculative.draft.n_min))
         ->set_hard_limits(0, INT32_MAX)
-        ->set_desc("Minimum number of draft tokens to use for speculative decoding");
+        ->set_desc("Minimum number of draft tokens to use for speculative decoding"));
 
     add((new field_num("speculative.p_min", params.speculative.draft.p_min))
         ->set_hard_limits(0.0f, 1.0f)
@@ -219,7 +218,6 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
     add((new field_num("speculative.ngram_min_hits", params.speculative.ngram_simple.min_hits))
         ->set_desc("Minimum hits at ngram lookup for mgram to be proposed"));
-#endif
 
     add((new field_json("lora"))
         ->set_desc("A list of LoRA adapters to apply to this request. Each entry must have `id` and `scale` fields. Adapters not listed default to scale 0.0")
