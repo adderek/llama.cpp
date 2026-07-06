@@ -427,6 +427,10 @@ extern "C" void turbo2_0_quantize_hip(const float * src, void * dst, int nrows) 
     dim3 block(32);  /* one RDNA3 wavefront */
     hipLaunchKernelGGL(turbo2_quantize_kernel_rdna3, grid, block, 0, 0,
                        src, (uint8_t *)dst, nrows);
+    /* from_float is assumed synchronous by every caller (incl. the checkpoint
+       readback on a different stream) but this launch has no stream to join -
+       force it here or callers can read back stale/in-flight GPU memory. */
+    hipStreamSynchronize(0);
 }
 
 extern "C" void turbo3_0_quantize_hip(const float * src, void * dst, int nrows) {
@@ -434,6 +438,7 @@ extern "C" void turbo3_0_quantize_hip(const float * src, void * dst, int nrows) 
     dim3 block(32);  /* one RDNA3 wavefront */
     hipLaunchKernelGGL(turbo3_quantize_kernel_rdna3, grid, block, 0, 0,
                        src, (uint8_t *)dst, nrows);
+    hipStreamSynchronize(0);
 }
 
 extern "C" void turbo4_0_quantize_hip(const float * src, void * dst, int nrows) {
@@ -441,6 +446,7 @@ extern "C" void turbo4_0_quantize_hip(const float * src, void * dst, int nrows) 
     dim3 block(32);  /* one RDNA3 wavefront — TURBO4_USE_4BIT=1 layout */
     hipLaunchKernelGGL(turbo4_quantize_kernel_rdna3, grid, block, 0, 0,
                        src, (uint8_t *)dst, nrows);
+    hipStreamSynchronize(0);
 }
 
 /* Keep old name as alias so the call site in ggml-turbo-quant.c continues to compile
