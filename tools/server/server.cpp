@@ -14,6 +14,8 @@
 
 #include <atomic>
 #include <clocale>
+#include <climits>
+#include <cstdlib>
 #include <exception>
 #include <signal.h>
 #include <thread> // for std::thread::hardware_concurrency
@@ -21,6 +23,34 @@
 #if defined(_WIN32)
 #include <windows.h>
 #endif
+
+#if defined(__linux__) && defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
+// The large state buffers - prompt cache entries and context checkpoints - are plain heap
+// allocations that the GPU reads out of directly (llama_state_seq_set_data_ext -> H2D copies).
+// glibc returns blocks of that size to the kernel when they are freed (munmap of the chunk, or a
+// trim of the arena top), which also tears down the mapping the GPU driver keeps for those pages,
+// including for *neighbouring* buffers still being transferred. The copy engine then walks memory
+// the kernel has taken away and the process dies with
+//
+//   Memory access fault by GPU node-N ... Reason: Page not present or supervisor privilege
+//   (amdgpu: SDMA0 read fault, on ROCm)
+//
+// Keeping the heap mapped removes the hazard - freed blocks stay in the allocator's free lists and
+// get reused instead of being handed back. Costs some RSS; set LLAMA_KEEP_HEAP_MAPPED=0 to opt out.
+static void keep_heap_mapped() {
+#if defined(__linux__) && defined(__GLIBC__)
+    const char * opt_out = getenv("LLAMA_KEEP_HEAP_MAPPED");
+    if (opt_out && atoi(opt_out) == 0) {
+        return;
+    }
+
+    mallopt(M_MMAP_MAX,       0);       // do not give large allocations their own mmap
+    mallopt(M_TRIM_THRESHOLD, INT_MAX); // do not return the top of the arena to the kernel
+#endif
+}
 
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
@@ -77,6 +107,8 @@ int llama_server(int argc, char ** argv);
 
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    keep_heap_mapped();
 
     // own arguments required by this example
     common_params params;

@@ -1620,7 +1620,22 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+void server_prompt_cache::retire(std::vector<uint8_t> & data) {
+    if (data.empty()) {
+        return;
+    }
+
+    retired.push_back(std::move(data));
+
+    data.clear();
+    data.shrink_to_fit();
+}
+
 server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    // release the state buffers retired during the previous cache operation - by now any DMA that
+    // was still reading them has long completed
+    retired.clear();
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->tokens.get_common_prefix(prompt.tokens);
@@ -1676,6 +1691,9 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    // see alloc() - `load()` can be reached without going through `alloc()` first
+    retired.clear();
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1719,8 +1737,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            retire(data);
         }
 
         {
@@ -1737,8 +1754,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                retire(data);
             }
         }
 

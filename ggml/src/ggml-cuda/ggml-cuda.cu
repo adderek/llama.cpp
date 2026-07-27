@@ -3346,7 +3346,14 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    ggml_cuda_set_device(cuda_ctx->device);
+
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+
+    // set_tensor/get_tensor copies are issued on cudaStreamPerThread, not on the backend stream -
+    // wait for those as well, so that a caller which synchronizes before releasing a host buffer
+    // cannot leave the DMA engine reading memory that is about to be unmapped
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 
     GGML_UNUSED(backend);
 }

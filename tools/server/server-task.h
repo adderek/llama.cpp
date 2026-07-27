@@ -629,6 +629,12 @@ struct server_prompt_cache {
 
     std::list<server_prompt> states;
 
+    // state buffers of prompts that have just been restored into a slot - the backend can still be
+    // reading them via DMA when llama_state_seq_set_data_ext() returns, and unmapping them under an
+    // in-flight transfer faults the GPU (observed on ROCm as an SDMA read fault on the freed pages),
+    // so they are kept alive until the next cache operation instead of being freed immediately
+    std::vector<std::vector<uint8_t>> retired;
+
     // in bytes, 0 = no limit
     size_t limit_size = 0;
 
@@ -644,6 +650,9 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
 
     void update();
+
+    // hand over a state buffer for delayed release, and free everything handed over earlier
+    void retire(std::vector<uint8_t> & data);
 };
 
 // used exclusively by router mode

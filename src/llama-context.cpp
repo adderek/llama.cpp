@@ -2936,7 +2936,15 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
         io->write(&io_magic, sizeof(io_magic));
         io->write(&seq_id, sizeof(seq_id));
 
-        return state_seq_write_data(*io, seq_id, flags);
+        const size_t res = state_seq_write_data(*io, seq_id, flags);
+
+        // same as in state_seq_set_data(): flush the deferred tensor reads and wait for them, so that
+        // `dst` is fully written (and no longer referenced by the DMA engine) when we return
+        io.reset();
+
+        synchronize();
+
+        return res;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error saving state: %s\n", __func__, err.what());
         return 0;
@@ -2975,7 +2983,16 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
         llama_seq_id seq_id_read;
         io->read(&seq_id_read, sizeof(seq_id_read));
 
-        return state_seq_read_data(*io, seq_id, flags);
+        const size_t res = state_seq_read_data(*io, seq_id, flags);
+
+        // the tensor writes are deferred and only issued when `io` is destroyed - destroy it here and
+        // wait for the devices, because the caller is free to release `src` as soon as we return and
+        // the copies out of it must not still be in flight (observed as an SDMA page fault on ROCm)
+        io.reset();
+
+        synchronize();
+
+        return res;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading state: %s\n", __func__, err.what());
         return 0;
