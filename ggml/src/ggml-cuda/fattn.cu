@@ -385,6 +385,22 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO2_0)
     FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0)
 
+    // Mixed f16/turbo KV cache types (asymmetric K/V precision)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,      GGML_TYPE_TURBO4_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO4_0, GGML_TYPE_F16)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,      GGML_TYPE_TURBO3_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO3_0, GGML_TYPE_F16)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,      GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TURBO2_0, GGML_TYPE_F16)
+    FATTN_VEC_CASE(512, GGML_TYPE_F16,      GGML_TYPE_TURBO2_0)
+    FATTN_VEC_CASE(512, GGML_TYPE_TURBO2_0, GGML_TYPE_F16)
+
     GGML_ABORT("fatal error");
 }
 
@@ -506,12 +522,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // Allow mixed turbo KV types (any combination of turbo2, turbo3, q8_0)
+        // Only the mixed KV combinations that have VEC instances are allowed here,
+        // otherwise ggml_cuda_flash_attn_ext_vec aborts.
         auto is_turbo = [](ggml_type t) {
-            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0
-                || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+            return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
         };
-        if (!is_turbo(K->type) || !is_turbo(V->type)) {
+        auto is_quant_mix = [&](ggml_type t) {
+            return is_turbo(t) || t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0;
+        };
+        auto is_f16 = [](ggml_type t) {
+            return t == GGML_TYPE_F16 || t == GGML_TYPE_F32;
+        };
+        const bool quant_mix = is_quant_mix(K->type) && is_quant_mix(V->type);
+        const bool f16_turbo_mix = (is_f16(K->type) && is_turbo(V->type)) || (is_turbo(K->type) && is_f16(V->type));
+        if (!quant_mix && !f16_turbo_mix) {
             return BEST_FATTN_KERNEL_NONE;
         }
     }
@@ -636,6 +660,20 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             }
         }
     }
+
+#ifdef GGML_USE_HIP
+    // The tile kernels for D >= 576 exceed the HIP local memory limit and are not compiled,
+    // see ggml_cuda_flash_attn_ext_tile - those head sizes must therefore not select TILE.
+    // Fall back to the non-FlashAttention path rather than aborting if MMA is also unavailable.
+    if (Q->ne[0] >= 576) {
+        // MMA also needs LDS for a D-sized Q tile, which only CDNA and RDNA4 have enough of here;
+        // on RDNA3 both kernels are out, so report the op as unsupported instead of failing a launch.
+        if (amd_mfma_available(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+        return BEST_FATTN_KERNEL_NONE;
+    }
+#endif // GGML_USE_HIP
 
     return BEST_FATTN_KERNEL_TILE;
 }

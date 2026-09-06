@@ -2880,7 +2880,17 @@ private:
                 }
             }
 
-            g_stall_armed.store(!all_idle, std::memory_order_relaxed);
+            // Reset the clock when arming, not just when decoding: g_stall_last_us
+            // still holds the timestamp of the last decode before the idle gap, so
+            // without this the first tick after a quiet period charges the whole gap
+            // to the new request and dumps a backtrace for a stall that never was.
+            // Order matters — mark activity BEFORE arming, or the watchdog thread can
+            // sample the stale timestamp in the window between the two stores.
+            const bool stall_busy = !all_idle;
+            if (stall_busy && !g_stall_armed.load(std::memory_order_relaxed)) {
+                stall_mark_activity();
+            }
+            g_stall_armed.store(stall_busy, std::memory_order_relaxed);
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");

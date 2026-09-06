@@ -50,10 +50,24 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // The indexer keys are read back with GET_ROWS and then normed and roped, so they must
+        // stay in the model space. TurboQuant stores them WHT-rotated and has no GET_ROWS
+        // support, so fall back to f16 for this cache.
+        auto no_turbo = [](ggml_type t) {
+            return (t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0)
+                ? GGML_TYPE_F16 : t;
+        };
+        const ggml_type idx_type_k = no_turbo(type_k);
+        const ggml_type idx_type_v = no_turbo(type_v);
+        if (idx_type_k != type_k || idx_type_v != type_v) {
+            LLAMA_LOG_INFO("%s: indexer KV cache does not support turbo types, using %s\n",
+                    __func__, ggml_type_name(idx_type_k));
+        }
+
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
+            model, hparams_idx, idx_type_k, idx_type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
     }()) {}
