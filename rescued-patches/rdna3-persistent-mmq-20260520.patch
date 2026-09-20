@@ -1,0 +1,197 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 41566d41a..3ec7c7ea7 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -403,6 +403,7 @@ extern "C" {
+         GGML_TYPE_Q5_K    = 13,
+         GGML_TYPE_Q6_K    = 14,
+         GGML_TYPE_Q8_K    = 15,
++        GGML_TYPE_TURBO_BGS = 16,
+         GGML_TYPE_IQ2_XXS = 16,
+         GGML_TYPE_IQ2_XS  = 17,
+         GGML_TYPE_IQ3_XXS = 18,
+diff --git a/ggml/src/ggml-cuda/mmf.cu b/ggml/src/ggml-cuda/mmf.cu
+index aad4c34aa..881fceb8b 100644
+--- a/ggml/src/ggml-cuda/mmf.cu
++++ b/ggml/src/ggml-cuda/mmf.cu
+@@ -166,7 +166,7 @@ bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const
+             return false;
+         }
+     } else {
+-        if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 8) {
++        if (GGML_CUDA_CC_IS_RDNA3_0(cc) && src1_ncols > 15) {
+             return false;
+         } else if (GGML_CUDA_CC_IS_CDNA2(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
+             //TODO: truse CDNA2 as CDNA1, tune the perf when CDNA2 is available.
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index edf546d8f..f06eb07a7 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -3921,6 +3921,124 @@ static __global__ void mul_mat_q_stream_k_fixup(
+     }
+ }
+ 
++// True persistent kernel for RDNA3: each block loops, atomically claiming tiles.
++// No K-split → no fixup kernel, no second launch. Each tile is fully owned by one block.
++// Tiles are claimed in chunks to reduce L2 atomic pressure from concurrent blocks.
++template <ggml_type type, int mmq_x, bool need_check>
++#if defined(GGML_USE_HIP) && (defined(RDNA3) || defined(RDNA4) || defined(RDNA2) || defined(CDNA) || defined(GCN))
++    __launch_bounds__(ggml_cuda_get_physical_warp_size()*mmq_get_nwarps_device(), 2)
++#endif
++static __global__ void mul_mat_q_persistent(
++        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
++        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, int * __restrict__ tile_counter,
++        const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
++        const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
++        const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
++        const uint3 ntx) {
++
++    if (mmq_x > get_mmq_x_max_device() || mmq_x % mmq_get_granularity_device(mmq_x) != 0) {
++        NO_DEVICE_CODE;
++        return;
++    }
++
++    constexpr int nwarps    = mmq_get_nwarps_device();
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int mmq_y     = get_mmq_y_device();
++
++    // Claim CHUNK tiles per atomicAdd to reduce L2 contention from ~gridDim.x concurrent atomics.
++    constexpr int CHUNK = 4;
++
++    const int nty    = (nrows_x + mmq_y - 1) / mmq_y;
++    const int ntiles = (int)(ntx.z * nchannels_y.z * nsamples_y.z) * nty;
++
++    extern __shared__ int ids_dst_shared[];
++    __shared__ int chunk_start_shmem;
++
++    while (true) {
++        // One thread claims the next chunk, broadcasts via shared memory.
++        if (threadIdx.x == 0 && threadIdx.y == 0) {
++            chunk_start_shmem = atomicAdd(tile_counter, CHUNK);
++        }
++        __syncthreads();
++
++        const int cs = chunk_start_shmem;
++        if (cs >= ntiles) {
++            break;
++        }
++        const int ce = min(cs + CHUNK, ntiles);
++
++        for (int tile = cs; tile < ce; tile++) {
++            // Initialize ids for direct (non-MoE) writeback.
++#pragma unroll
++            for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
++                const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
++                if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
++                    break;
++                }
++                ids_dst_shared[j] = j;
++            }
++            __syncthreads();
++
++            // Decode tile index (same encoding as stream-k: jt=LSB, it=MSB).
++            int tmp = tile;
++            uint2 tmp2 = fast_div_modulo(tmp, ntx);
++            const int jt = tmp2.y;
++            tmp = tmp2.x;
++            tmp2 = fast_div_modulo(tmp, nchannels_y);
++            const int zt = tmp2.y;
++            tmp = tmp2.x;
++            tmp2 = fast_div_modulo(tmp, nsamples_y);
++            const int wt = tmp2.y;
++            const int it = tmp2.x;
++
++            int col_low  = 0;
++            int col_high = ncols_dst;
++            int col_diff = ncols_dst;
++            int offset_y   = wt*stride_sample_y   + zt*stride_channel_y;
++            int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst;
++
++            if (ids_dst) {
++                col_low  = expert_bounds[zt + 0];
++                col_high = expert_bounds[zt + 1];
++                col_diff = col_high - col_low;
++                offset_y   = 0;
++                offset_dst = 0;
++
++                if (jt*mmq_x >= col_diff) {
++                    continue;  // empty MoE tile — all threads skip together
++                }
++
++                __syncthreads();
++#pragma unroll
++                for (int j0 = 0; j0 < mmq_x; j0 += nwarps*warp_size) {
++                    const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
++                    if (j0 + nwarps*warp_size > mmq_x && j >= mmq_x) {
++                        break;
++                    }
++                    ids_dst_shared[j] = ids_dst[col_low + jt*mmq_x + j];
++                }
++                __syncthreads();
++            }
++
++            offset_y   += (col_low + jt*mmq_x) * (sizeof(block_q8_1_mmq)/sizeof(int));
++            offset_dst += it*mmq_y;
++
++            const int tile_x_max_i = nrows_x  - it*mmq_y - 1;
++            const int tile_y_max_j = col_diff - jt*mmq_x - 1;
++            const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x
++                                + fastdiv(zt, channel_ratio)*stride_channel_x
++                                + it*mmq_y*stride_row_x;
++
++            // Full K, direct writeback to dst — no fixup needed since each tile is owned by one block.
++            constexpr bool fixup = false;
++            mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
++                (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, nullptr,
++                 stride_row_x, ncols_y, stride_col_dst,
++                 tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
++        }
++    }
++}
++
+ struct mmq_args {
+     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
+@@ -3972,6 +4090,42 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
+     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
+ 
++    // NOTE: persistent tile-stealing (atomicAdd-based) was benchmarked and found slower than conventional:
++    // atomic contention (192 blocks hitting one L2 address) dominates; large CHUNK causes load imbalance.
++    // Conventional tiling already achieves optimal scheduling via the HW wave scheduler with zero overhead.
++    if (false && GGML_CUDA_CC_IS_RDNA3(cc)) {
++        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_persistent<type, mmq_x, false>), nbytes_shared);
++        CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_persistent<type, mmq_x,  true>), nbytes_shared);
++
++        ggml_cuda_pool & pool = ctx.pool(id);
++        ggml_cuda_pool_alloc<int> tile_counter(pool);
++        tile_counter.alloc(1);
++        CUDA_CHECK(cudaMemsetAsync(tile_counter.get(), 0, sizeof(int), stream));
++
++        // Cap at ntiles: avoid launching idle blocks when tile count is small.
++        const int ntiles_dst = ntx * nty * ntzw;
++        const dim3 block_nums_persistent(min(nsm * 2, ntiles_dst), 1, 1);
++
++        if (args.nrows_x % mmq_y == 0) {
++            constexpr bool need_check = false;
++            mul_mat_q_persistent<type, mmq_x, need_check><<<block_nums_persistent, block_dims, nbytes_shared, stream>>>
++                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_counter.get(),
++                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
++                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
++                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
++                 ntx_fd);
++        } else {
++            constexpr bool need_check = true;
++            mul_mat_q_persistent<type, mmq_x, need_check><<<block_nums_persistent, block_dims, nbytes_shared, stream>>>
++                (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tile_counter.get(),
++                 blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
++                 channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
++                 sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
++                 ntx_fd);
++        }
++        return;
++    }
++
+     if (!args.use_stream_k) {
+         if (args.nrows_x % mmq_y == 0) {
+             constexpr bool need_check = false;
