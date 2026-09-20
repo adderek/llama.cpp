@@ -29,7 +29,13 @@ extern void turbo4_0_quantize_hip(const float * src, void * dst, int nrows);
 #endif
 
 /* Global: WHT group size for CPU quantize path (set by CPU SET_ROWS handler) */
-GGML_API int turbo3_cpu_wht_group_size = 0;
+// thread_local, not a plain global: ops.cpp writes this from every worker
+// thread of the SET_ROWS node before calling from_float, and the quantize
+// routines below read it back. Same-value writes make the race benign in
+// practice, but it is still UB and TSan flags it.
+// GGML_API is kept: this is defined in libggml-base and read from
+// libggml-cpu, so dropping it would leave an undefined symbol.
+GGML_API _Thread_local int turbo3_cpu_wht_group_size = 0;
 
 /* ---------- constants ---------- */
 
@@ -286,7 +292,7 @@ void quantize_row_turbo3_0_ref(const float * GGML_RESTRICT x, block_turbo3_0 * G
 
     // Read WHT group size from global (set by CPU SET_ROWS handler before each call).
     // Fallback: 128 if row is 128-aligned, else 64.
-    extern int turbo3_cpu_wht_group_size;
+    extern _Thread_local int turbo3_cpu_wht_group_size;
     int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
@@ -391,7 +397,7 @@ size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT d
 void quantize_row_turbo2_0_ref(const float * GGML_RESTRICT x, block_turbo2_0 * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_TURBO2 == 0);
 
-    extern int turbo3_cpu_wht_group_size;
+    extern _Thread_local int turbo3_cpu_wht_group_size;
     int group_size = turbo3_cpu_wht_group_size;
     if (group_size != 64 && group_size != 128) {
         group_size = (k % 128 == 0) ? 128 : 64;
