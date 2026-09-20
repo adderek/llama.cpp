@@ -695,6 +695,36 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
+    // TurboQuant pre-rotate-queries, mirroring llm_graph_context::build_attn.
+    //
+    // There are TWO rotation mechanisms and this path only had the first:
+    //   * upstream Hadamard (inp->self_k_rot above) — the kv-cache turns it OFF
+    //     when TurboQuant is active ("upstream attention rotation disabled")
+    //   * TurboQuant kernel-level WHT — applied to Q in build_attn, but this
+    //     function calls build_attn_mha directly and so skipped it
+    //
+    // K comes out of the cache WHT-rotated either way, so without this Q stays
+    // in model space and <Q, K> is computed across two different bases. Nothing
+    // aborts: the scores are simply wrong, and the inverse WHT that
+    // build_attn_mha applies to the output (keyed on v->type) faithfully
+    // un-rotates a garbage-weighted sum. Measured before this block: the model
+    // answered "FOXTROT" — a filler word from the prompt — instead of the
+    // planted needle, identically on CPU, one card and a two-card split, at
+    // 8192/16384/65536 context. f16 answered correctly in every one of them.
+    //
+    // Condition is on k->type, not v->type: K determines the rotation (they can
+    // differ under MLA, where V is a view of K with a different ne[0]).
+    if (k->type == GGML_TYPE_TURBO3_0 || k->type == GGML_TYPE_TURBO4_0 || k->type == GGML_TYPE_TURBO2_0) {
+        // pad Q per-head to the next multiple of 128, as the dense path does
+        if (q->ne[0] % 128 != 0) {
+            const int64_t pad = ((q->ne[0] + 127) / 128) * 128 - q->ne[0];
+            q = ggml_pad(ctx0, q, pad, 0, 0, 0);
+        }
+        if (!ggml_is_contiguous(q)) { q = ggml_cont(ctx0, q); }
+        ggml_tensor * innerq_scale = mctx_cur->get_turbo_innerq_scale_inv();
+        q = ggml_turbo_wht(ctx0, q, 0, 0, innerq_scale);  // 0 = forward, 0 = auto group size
+    }
+
     ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, kq_scale, il);
     cb(cur, "kqv_out", il);
 
