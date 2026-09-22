@@ -12,6 +12,7 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
@@ -770,6 +771,9 @@ using llm_graph_cb = std::function<void(const llama_ubatch & ubatch, ggml_tensor
 
 class llm_graph_result;
 
+// cold part of a MoE expert tensor split by LLAMA_MOE_HOT, keyed by the hot part
+using llm_moe_cold_map = std::unordered_map<const ggml_tensor *, ggml_tensor *>;
+
 struct llm_graph_params {
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -812,6 +816,8 @@ struct llm_graph_params {
     llm_graph_cb cb;
 
     llm_graph_result * res;
+
+    const llm_moe_cold_map * moe_cold = nullptr;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1038,6 +1044,8 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
+    const llm_moe_cold_map * moe_cold;
+
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
@@ -1065,7 +1073,8 @@ struct llm_graph_context {
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s = nullptr,
+                     bool   partial = false) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1161,6 +1170,27 @@ struct llm_graph_context {
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
+
+    // routed experts only: [n_embd, n_expert_used, n_tokens], not weighted
+    // ids index exps; ids_b indexes the per-expert biases
+    ggml_tensor * build_moe_ffn_exps(
+             ggml_tensor * cur,
+             ggml_tensor * ids,
+             ggml_tensor * ids_b,
+             ggml_tensor * up_exps,
+             ggml_tensor * up_exps_b,
+             ggml_tensor * gate_exps,
+             ggml_tensor * gate_exps_b,
+             ggml_tensor * down_exps,
+             ggml_tensor * down_exps_b,
+             ggml_tensor * gate_up_exps,
+             ggml_tensor * gate_up_exps_b,
+             ggml_tensor * up_exps_s,
+             ggml_tensor * gate_exps_s,
+             ggml_tensor * down_exps_s,
+         llm_ffn_op_type   type_op,
+                     int   il,
+                    bool   partial) const;
 
     //
     // inputs

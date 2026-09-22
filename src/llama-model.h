@@ -730,6 +730,9 @@ struct llama_model {
     // for quantize-stats only
     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
 
+    // cold parts of MoE expert tensors split by LLAMA_MOE_HOT
+    llm_moe_cold_map moe_cold;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

@@ -1139,6 +1139,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
+            max_n_tensors += hparams.n_layer_all*3; // cold expert tensors from split_experts
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1398,6 +1399,42 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+void llama_model_loader::split_experts(const std::string & name, int64_t n_hot) {
+    auto it = weights_map.find(name);
+    GGML_ASSERT(it != weights_map.end());
+
+    const llama_tensor_weight w = it->second;
+    const ggml_tensor * t = w.tensor;
+    GGML_ASSERT(n_hot > 0 && n_hot < t->ne[2] && t->ne[3] == 1 && ggml_is_contiguous(t));
+
+    if (!ctx_split) {
+        ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead()*2*weights_map.size(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_split.reset(ggml_init(params));
+    }
+
+    auto make_meta = [&](const std::string & meta_name, int64_t ne2) {
+        ggml_tensor * m = ggml_new_tensor_3d(ctx_split.get(), t->type, t->ne[0], t->ne[1], ne2);
+        ggml_set_name(m, meta_name.c_str());
+        return m;
+    };
+
+    const std::string name_cold = name + ".cold";
+
+    llama_tensor_weight hot  = w;
+    llama_tensor_weight cold = w;
+    hot.tensor  = make_meta(name, n_hot);
+    cold.tensor = make_meta(name_cold, t->ne[2] - n_hot);
+    cold.offs  += n_hot*t->nb[2];
+
+    it->second = hot;
+    weights_map.emplace(name_cold, cold);
+    n_tensors++;
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
