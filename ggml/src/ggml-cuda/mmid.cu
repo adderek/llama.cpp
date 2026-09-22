@@ -44,7 +44,7 @@ static __global__ void mm_ids_helper(
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -69,7 +69,7 @@ static __global__ void mm_ids_helper(
             const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
                 ids[it*si1 + iex] : INT_MAX;
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -166,4 +166,28 @@ void ggml_cuda_launch_mm_ids_helper(
             launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
             break;
     }
+}
+
+// rows with ids < 0 are not computed by the mul_mat_id kernels, set them to zero
+static __global__ void mm_ids_zero_skipped(
+        const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int n_expert_used, const int ncols_dst, const int si1, const int sd1, const int sd2) {
+    const int iex = blockIdx.x;
+    const int it  = blockIdx.y;
+
+    if (ids[it*si1 + iex] >= 0) {
+        return;
+    }
+
+    float * dst_row = dst + it*sd2 + iex*sd1;
+    for (int i = threadIdx.x; i < ncols_dst; i += blockDim.x) {
+        dst_row[i] = 0.0f;
+    }
+}
+
+void ggml_cuda_mm_ids_zero_skipped(
+        const int32_t * ids, float * dst, int n_expert_used, int n_tokens, int ncols_dst,
+        int si1, int sd1, int sd2, cudaStream_t stream) {
+    const dim3 num_blocks(n_expert_used, n_tokens, 1);
+    mm_ids_zero_skipped<<<num_blocks, 256, 0, stream>>>(ids, dst, n_expert_used, ncols_dst, si1, sd1, sd2);
 }
