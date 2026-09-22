@@ -1509,6 +1509,16 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // same, but ids < 0 mean "no expert": that row is not computed and is set to zero
+    // lets two mul_mat_id calls split the experts of one layer over two backends
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_partial(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    GGML_API bool ggml_mul_mat_id_is_partial(const struct ggml_tensor * a);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows
