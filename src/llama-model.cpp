@@ -1818,11 +1818,60 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
+// LLAMA_MOE_HOT=N: keep the first N experts of each MoE layer in the layer buffer and the rest in a plain CPU buffer
+// use it with a model from tools/moe-tier, where the experts are sorted by use
+static int64_t moe_hot_count(const llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+    static const char * env = getenv("LLAMA_MOE_HOT");
+    if (env == nullptr || ml.files.empty() || (flags & llama_model_loader::TENSOR_SKIP) || ne.size() != 3) {
+        return 0;
+    }
+    if (tn.tensor != LLM_TENSOR_FFN_GATE_EXPS && tn.tensor != LLM_TENSOR_FFN_UP_EXPS &&
+        tn.tensor != LLM_TENSOR_FFN_DOWN_EXPS && tn.tensor != LLM_TENSOR_FFN_GATE_UP_EXPS) {
+        return 0;
+    }
+    if (tn.suffix == nullptr || strcmp(tn.suffix, "weight") != 0 || ml.get_weight(tn.str().c_str()) == nullptr) {
+        return 0;
+    }
+    const int64_t n_expert = ne.begin()[2];
+    const int64_t n_hot    = atoll(env);
+    return n_hot > 0 && n_hot < n_expert ? n_hot : 0;
+}
+
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+
+    const int64_t n_hot = moe_hot_count(ml, tn, ne, flags);
+    if (n_hot == 0) {
+        return ml.create_tensor(
+            hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
+            tn, ne, flags);
+    }
+
+    const int64_t ne0 = ne.begin()[0];
+    const int64_t ne1 = ne.begin()[1];
+    const int64_t ne2 = ne.begin()[2];
+
+    ml.split_experts(tn.str(), n_hot);
+
+    ggml_tensor * hot = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, {ne0, ne1, n_hot}, flags);
+
+    // plain CPU buffer so that the cold experts stay in the mmap (page cache, can be read from disk on demand)
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    const buft_list_t buft_list_cold = { { cpu_dev, ggml_backend_dev_buffer_type(cpu_dev) } };
+
+    const LLM_TN_IMPL tn_cold(tn.arch, tn.tensor, "weight.cold", tn.bid, tn.xid);
+    ggml_tensor * cold = ml.create_tensor(
+        hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, &buft_list_cold,
+        tn_cold, {ne0, ne1, ne2 - n_hot}, flags);
+
+    GGML_ASSERT(hot && cold);
+    moe_cold[hot] = cold;
+
+    LLAMA_LOG_DEBUG("%s: %s split into %lld hot and %lld cold experts\n", __func__, tn.str().c_str(), (long long) n_hot, (long long) (ne2 - n_hot));
+
+    return hot;
 }
 
 std::string llama_model::arch_name() const {

@@ -105,6 +105,7 @@ struct llama_model_loader {
     llama_model_set_tensor_data_t set_tensor_data;
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
+    ggml_context_ptr ctx_split; // meta tensors made by split_experts
 
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
@@ -196,6 +197,10 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // make weight `name` [ne0, ne1, n_expert] hold the first n_hot experts and add weight `name`.cold for the rest
+    // both stay views of the same file data
+    void split_experts(const std::string & name, int64_t n_hot);
 
     void done_getting_tensors(bool partial = false) const;
 

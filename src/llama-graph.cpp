@@ -1489,6 +1489,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    moe_cold         (params.moe_cold),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -1543,8 +1544,9 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * w,   // ggml_tensor * as
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
-          ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+          ggml_tensor * w_s,
+          bool          partial) const {
+    ggml_tensor * res = partial ? ggml_mul_mat_id_partial(ctx0, w, cur, ids) : ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
         const int64_t n_expert = w_s->ne[0];
@@ -2111,12 +2113,122 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    ggml_tensor * down_cold = nullptr;
+    if (moe_cold) {
+        const auto it = moe_cold->find(down_exps);
+        if (it != moe_cold->end()) {
+            down_cold = it->second;
+        }
+    }
+
+    ggml_tensor * experts = nullptr;
+
+    if (down_cold == nullptr) {
+        experts = build_moe_ffn_exps(cur, selected_experts, selected_experts,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, gate_up_exps, gate_up_exps_b,
+                up_exps_s, gate_exps_s, down_exps_s, type_op, il, false);
+    } else {
+        // experts [0, n_hot) are in the hot tensors, the rest in the cold tensors
+        // each part gets id < 0 for the slots of the other part, which mul_mat_id then skips and zeroes
+        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s && "LLAMA_MOE_HOT does not support expert scales");
+
+        auto cold = [&](ggml_tensor * t) -> ggml_tensor * {
+            if (t == nullptr) {
+                return nullptr;
+            }
+            const auto it = moe_cold->find(t);
+            GGML_ASSERT(it != moe_cold->end());
+            return it->second;
+        };
+
+        const float n_hot = down_exps->ne[2];
+
+        ggml_tensor * ids_f     = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        ggml_tensor * mask_hot  = ggml_step(ctx0, ggml_scale_bias(ctx0, ids_f, -1.0f, n_hot - 0.5f));
+        ggml_tensor * mask_cold = ggml_scale_bias(ctx0, mask_hot, -1.0f, 1.0f);
+
+        // id if the slot belongs to this part, -1 if it does not
+        ggml_tensor * ids_hot  = ggml_cast(ctx0,
+                ggml_add(ctx0, ggml_mul(ctx0, ids_f, mask_hot), ggml_scale_bias(ctx0, mask_hot, 1.0f, -1.0f)), GGML_TYPE_I32);
+        ggml_tensor * ids_cold = ggml_cast(ctx0,
+                ggml_add(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, ids_f, 1.0f, -n_hot), mask_cold), ggml_scale_bias(ctx0, mask_cold, 1.0f, -1.0f)), GGML_TYPE_I32);
+        cb(ids_hot, "ffn_moe_topk_hot", il);
+
+        ggml_tensor * exps_hot = build_moe_ffn_exps(cur, ids_hot, selected_experts,
+                up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, gate_up_exps, gate_up_exps_b,
+                nullptr, nullptr, nullptr, type_op, il, true);
+        ggml_tensor * exps_cold = build_moe_ffn_exps(cur, ids_cold, selected_experts,
+                cold(up_exps), up_exps_b, cold(gate_exps), gate_exps_b, down_cold, down_exps_b, cold(gate_up_exps), gate_up_exps_b,
+                nullptr, nullptr, nullptr, type_op, il, true);
+
+        experts = ggml_add(ctx0, exps_hot, exps_cold);
+        cb(experts, "ffn_moe_down_merged", il);
+    }
+
+    if (!weight_before_ffn) {
+        experts = ggml_mul(ctx0, experts, weights);
+        cb(experts, "ffn_moe_weighted", il);
+    }
+
+    ggml_build_forward_expand(gf, experts);
+
+    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+
+    assert(n_expert_used > 0);
+
+    // order the views before the adds
+    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
+        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+
+        ggml_build_forward_expand(gf, cur_experts[i]);
+    }
+
+    // aggregate experts
+    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
+    //       to avoid potentially a large number of add nodes during warmup
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
+    ggml_tensor * moe_out = cur_experts[0];
+
+    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
+
+        ggml_build_forward_expand(gf, moe_out);
+    }
+
+    if (hparams.n_expert_used == 1) {
+        // avoid returning a non-contiguous tensor
+        moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    cb(moe_out, "ffn_moe_out", il);
+
+    return moe_out;
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_exps(
+         ggml_tensor * cur,
+         ggml_tensor * ids,
+         ggml_tensor * ids_b,
+         ggml_tensor * up_exps,
+         ggml_tensor * up_exps_b,
+         ggml_tensor * gate_exps,
+         ggml_tensor * gate_exps_b,
+         ggml_tensor * down_exps,
+         ggml_tensor * down_exps_b,
+         ggml_tensor * gate_up_exps,
+         ggml_tensor * gate_up_exps_b,
+         ggml_tensor * up_exps_s,
+         ggml_tensor * gate_exps_s,
+         ggml_tensor * down_exps_s,
+     llm_ffn_op_type   type_op,
+                 int   il,
+                bool   partial) const {
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, partial); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2124,7 +2236,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_up_exps_b) {
-            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, ids_b);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
@@ -2135,7 +2247,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, partial); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2143,12 +2255,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (up_exps_b) {
-            up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            up = ggml_add_id(ctx0, up, up_exps_b, ids_b);
             cb(up, "ffn_moe_up_biased", il);
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, partial); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2159,7 +2271,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
 
         if (gate_exps_b) {
-            cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            cur = ggml_add_id(ctx0, cur, gate_exps_b, ids_b);
             cb(cur, "ffn_moe_gate_biased", il);
         }
     }
@@ -2252,7 +2364,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, partial); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
@@ -2260,48 +2372,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (down_exps_b) {
-        experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        experts = ggml_add_id(ctx0, experts, down_exps_b, ids_b);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
-        cb(experts, "ffn_moe_weighted", il);
-    }
-
-    ggml_build_forward_expand(gf, experts);
-
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
-
-    assert(n_expert_used > 0);
-
-    // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
-
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
-
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-
-        ggml_build_forward_expand(gf, moe_out);
-    }
-
-    if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
-        moe_out = ggml_cont(ctx0, moe_out);
-    }
-
-    cb(moe_out, "ffn_moe_out", il);
-
-    return moe_out;
+    return experts;
 }
 
 // input embeddings with optional lora
