@@ -40,6 +40,7 @@ void llama_moe_tier_layer::init(int64_t n_warm_, int64_t n_slots_) {
     n_slots = n_slots_;
 
     slot_expert.assign(n_slots, -1);
+    slot_call.assign(n_slots, -1);
 }
 
 void llama_moe_tier_layer::init_windows() {
@@ -58,14 +59,20 @@ static bool llama_moe_tier_pread(int fd, uint8_t * dst, size_t offs, size_t len,
         const size_t beg  = offs & ~(LLAMA_MOE_TIER_ALIGN - 1);
         const size_t span = ((offs - beg) + want + LLAMA_MOE_TIER_ALIGN - 1) & ~(LLAMA_MOE_TIER_ALIGN - 1);
 
+        // the aligned span can run past the end of the file; only the bytes up to offs + want are needed
+        const size_t need = (offs - beg) + want;
+
         size_t done = 0;
         while (done < span) {
             const ssize_t r = pread(fd, bounce_aligned + done, span - done, beg + done);
+            if (r == 0 && done >= need) {
+                break;
+            }
             if (r <= 0) {
                 if (r < 0 && errno == EINTR) {
                     continue;
                 }
-                LLAMA_LOG_ERROR("%s: read at %zu failed: %s\n", __func__, beg + done, strerror(errno));
+                LLAMA_LOG_ERROR("%s: read at %zu failed: %s\n", __func__, beg + done, r == 0 ? "end of file" : strerror(errno));
                 return false;
             }
             done += r;
@@ -104,7 +111,9 @@ void llama_moe_tier_layer::finalize(int fd_) {
 #if defined(__linux__)
     // the arena starts out holding the warm experts, which are a prefix of the cold ones
     for (const auto & a : arenas) {
-        llama_moe_tier_pread(fd, a.data, a.offs, a.slab*n_slots, bounce_aligned[0], bounce[0].size());
+        if (!llama_moe_tier_pread(fd, a.data, a.offs, a.slab*n_slots, bounce_aligned[0], bounce[0].size())) {
+            GGML_ABORT("MoE arena: could not read the warm experts");
+        }
     }
 #endif
 }
@@ -139,15 +148,25 @@ int32_t llama_moe_tier_layer::slot_for(int32_t expert, std::vector<std::pair<int
     for (int64_t s = n_warm; s < n_slots; ++s) {
         if (slot_expert[s] == expert) {
             n_hit++;
+            slot_call[s] = call;
             return (int32_t) s;
         }
     }
 
+    // round-robin over the frames this call does not use; the graph routes to at most n_frames experts per call
     const int64_t n_frames = n_slots - n_warm;
-    const int64_t slot     = n_warm + next_frame;
+    int64_t slot = -1;
+    for (int64_t i = 0; i < n_frames && slot < 0; ++i) {
+        const int64_t s = n_warm + next_frame;
+        next_frame = (next_frame + 1) % n_frames;
+        if (slot_call[s] != call) {
+            slot = s;
+        }
+    }
+    GGML_ASSERT(slot >= 0 && "MoE arena: more experts in one call than frames");
 
-    next_frame = (next_frame + 1) % n_frames;
     slot_expert[slot] = expert;
+    slot_call[slot]   = call;
     n_miss++;
 
     load.emplace_back((int32_t) slot, expert);
@@ -168,8 +187,11 @@ void llama_moe_tier_layer::load_slots(const std::vector<std::pair<int32_t, int32
         for (size_t i = ith; i < n_reads; i += n_threads) {
             const auto & l = load[i / arenas.size()];
             const auto & a = arenas[i % arenas.size()];
-            llama_moe_tier_pread(fd, a.data + (size_t) l.first*a.slab, a.offs + (size_t) l.second*a.slab, a.slab,
-                    bounce_aligned[ith], bounce[ith].size());
+            // a frame that failed to load holds another expert's weights: stop instead of computing with them
+            if (!llama_moe_tier_pread(fd, a.data + (size_t) l.first*a.slab, a.offs + (size_t) l.second*a.slab, a.slab,
+                    bounce_aligned[ith], bounce[ith].size())) {
+                GGML_ABORT("MoE arena: could not page in expert %d", l.second);
+            }
         }
     };
 
@@ -194,6 +216,8 @@ void llama_moe_tier_map_ids(struct ggml_tensor * dst, const struct ggml_tensor *
 
     GGML_ASSERT(a->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_are_same_shape(a, dst));
+
+    layer->call++;
 
     std::vector<std::pair<int32_t, int32_t>> load;
 

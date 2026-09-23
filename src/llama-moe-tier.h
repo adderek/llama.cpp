@@ -44,6 +44,10 @@ struct llama_moe_tier_layer {
     std::vector<int32_t> slot_expert; // which expert each frame holds, -1 if none
     int64_t              next_frame = 0;
 
+    // call that last used each frame: a frame hit earlier in the same call must not be replaced
+    std::vector<int64_t> slot_call;
+    int64_t              call = 0;
+
     // [0, n_slots), then n_slots - n_warm ids at a time; fixed after init so the graph can point at them
     std::vector<window>  windows;
 
