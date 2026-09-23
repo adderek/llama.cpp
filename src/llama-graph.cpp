@@ -1548,7 +1548,8 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s,
-          bool          partial) const {
+          bool          partial,
+          ggml_tensor * ids_s) const {
     ggml_tensor * res = partial ? ggml_mul_mat_id_partial(ctx0, w, cur, ids) : ggml_mul_mat_id(ctx0, w, cur, ids);
 
     if (w_s) {
@@ -1556,7 +1557,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
         const int64_t n_tokens = cur->ne[2];
         ggml_tensor * s = ggml_reshape_3d(ctx0, w_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
-        s = ggml_get_rows(ctx0, s, ids);
+        s = ggml_get_rows(ctx0, s, ids_s ? ids_s : ids);
         res = ggml_mul(ctx0, res, s);
     }
     for (const auto & lora : *loras) {
@@ -2133,7 +2134,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     } else {
         // experts [0, n_hot) are in the hot tensors, the rest in the cold tensors
         // each part gets id < 0 for the slots of the other part, which mul_mat_id then skips and zeroes
-        GGML_ASSERT(!up_exps_s && !gate_exps_s && !down_exps_s && "LLAMA_MOE_HOT does not support expert scales");
+        // scales are fine: build_moe_ffn_exps picks them by expert, and the rows of the other part stay zero.
+        // biases are not: add_id would add them to the zeroed rows too
+        GGML_ASSERT(!up_exps_b && !gate_exps_b && !down_exps_b && !gate_up_exps_b && "LLAMA_MOE_HOT does not support expert biases");
 
         auto cold = [&](ggml_tensor * t) -> ggml_tensor * {
             if (t == nullptr) {
@@ -2159,7 +2162,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         ggml_tensor * exps_hot = build_moe_ffn_exps(cur, ids_hot, selected_experts,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, gate_up_exps, gate_up_exps_b,
-                nullptr, nullptr, nullptr, type_op, il, true);
+                up_exps_s, gate_exps_s, down_exps_s, type_op, il, true);
         // the cold half can come from the RAM arena instead of the mmap, see llama-moe-tier.h
         ggml_tensor * cold_up   = cold(up_exps);
         ggml_tensor * cold_gate = cold(gate_exps);
@@ -2203,7 +2206,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
                     ggml_tensor * out = build_moe_ffn_exps(cur, ids_w, selected_experts,
                             frames(arena(cold_up)), up_exps_b, frames(arena(cold_gate)), gate_exps_b, frames(it_arena->second), down_exps_b,
-                            frames(arena(cold_gup)), gate_up_exps_b, nullptr, nullptr, nullptr, type_op, il, true);
+                            frames(arena(cold_gup)), gate_up_exps_b, up_exps_s, gate_exps_s, down_exps_s, type_op, il, true);
 
                     exps_cold = exps_cold ? ggml_add(ctx0, exps_cold, out) : out;
                     // one element is enough to order the next window after this pass
@@ -2227,7 +2230,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (experts == nullptr) {
             ggml_tensor * exps_cold = build_moe_ffn_exps(cur, ids_cold, selected_experts,
                     cold_up, up_exps_b, cold_gate, gate_exps_b, cold_down, down_exps_b, cold_gup, gate_up_exps_b,
-                    nullptr, nullptr, nullptr, type_op, il, true);
+                    up_exps_s, gate_exps_s, down_exps_s, type_op, il, true);
 
             experts = ggml_add(ctx0, exps_hot, exps_cold);
             cb(experts, "ffn_moe_down_merged", il);
@@ -2297,7 +2300,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_exps(
 
     if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
-        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, partial); // [n_ff*2, n_expert_used, n_tokens]
+        ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, partial, ids_b); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
         if (up_exps_s) {
@@ -2316,7 +2319,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_exps(
         cb(up, "ffn_moe_up", il);
     } else {
         // separate gate and up path
-        up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, partial); // [n_ff, n_expert_used, n_tokens]
+        up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, partial, ids_b); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
         if (up_exps_s) {
@@ -2329,7 +2332,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_exps(
         }
 
         if (gate_exps) {
-            cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, partial); // [n_ff, n_expert_used, n_tokens]
+            cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, partial, ids_b); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
             cur = up;
@@ -2433,7 +2436,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn_exps(
             GGML_ABORT("fatal error");
     }
 
-    experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, partial); // [n_embd, n_expert_used, n_tokens]
+    experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, partial, ids_b); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
     if (down_exps_s) {
