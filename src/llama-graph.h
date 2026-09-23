@@ -1081,7 +1081,8 @@ struct llm_graph_context {
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
               ggml_tensor * w_s = nullptr,
-                     bool   partial = false) const;
+                     bool   partial = false,
+              ggml_tensor * ids_s = nullptr) const; // ids for the scale rows, default ids
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
