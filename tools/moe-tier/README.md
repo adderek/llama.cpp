@@ -26,6 +26,11 @@ file layout.
 |---|---|
 | `LLAMA_MOE_HOT=N` | keep the first N experts of every MoE layer where the layer lives (GPU, `-ot` applies); the rest become `*_exps.weight.cold` in a plain CPU buffer |
 | `LLAMA_MOE_WARM=M` | of the cold experts, expect the first M to be reused; everything past them is dropped from the page cache after use |
+| `LLAMA_MOE_DIRECT=1` | page the cold experts from the file with O_DIRECT instead of reading them through the mmap; needs the settings below |
+| `LLAMA_MOE_ARENA=N` | experts pinned in the RAM arena (N x 61 layers x slab bytes, so size it against free RAM) |
+| `LLAMA_MOE_FRAMES=F` | replaceable frames on top of those; the arena path is used only while the ubatch routes to at most F experts, so prompt processing needs a small `-ub` |
+| `LLAMA_MOE_READERS=R` | threads issuing the page-ins (default 8); a single stream leaves most of the NVMe unused |
+| `LLAMA_MOE_STATS=1` | log hit/miss and where the routed experts fall in the permuted order |
 | `LLAMA_MOE_TRIM_EVERY=T` | drop those ranges every T decoded tokens (default 8) |
 | `GGML_MMID_PREFETCH=1` | read the experts a `mul_mat_id` needs in whole slabs instead of 64 KiB faults |
 | `LLAMA_NO_MMAP_PREFETCH=1` | do not ask the kernel to read the whole file at load; implied by `LLAMA_MOE_HOT` |

@@ -1839,7 +1839,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (auto & layer : moe_tier_layers) {
                 layer->finalize(fd);
             }
-            LLAMA_LOG_INFO("%s: MoE arena: %lld warm + %lld streamed experts per layer\n",
+            LLAMA_LOG_INFO("%s: MoE arena: %lld pinned + %lld paged frames per layer\n",
                     __func__, (long long) moe_tier_layers[0]->n_warm,
                     (long long) (moe_tier_layers[0]->n_slots - moe_tier_layers[0]->n_warm));
         }
@@ -1906,12 +1906,12 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
         // LLAMA_MOE_WARM, which says how much of the mmap is worth keeping in the page cache
         const char * arena_env   = getenv("LLAMA_MOE_ARENA");
         const char * warm_env    = getenv("LLAMA_MOE_WARM");
-        const char * victims_env = getenv("LLAMA_MOE_VICTIMS");
+        const char * frames_env = getenv("LLAMA_MOE_FRAMES");
 
         const int64_t n_cold    = ne2 - n_hot;
-        const int64_t n_victims = victims_env ? atoll(victims_env) : 32;
-        const int64_t n_warm    = std::min<int64_t>(arena_env ? atoll(arena_env) : (warm_env ? atoll(warm_env) : n_cold/2), n_cold - n_victims);
-        const int64_t n_slots   = n_warm + n_victims;
+        const int64_t n_frames = frames_env ? atoll(frames_env) : 32;
+        const int64_t n_warm    = std::min<int64_t>(arena_env ? atoll(arena_env) : (warm_env ? atoll(warm_env) : n_cold/2), n_cold - n_frames);
+        const int64_t n_slots   = n_warm + n_frames;
 
         GGML_ASSERT(n_warm > 0 && n_slots <= n_cold);
 

@@ -133,10 +133,10 @@ int32_t llama_moe_tier_layer::slot_for(int32_t expert, std::vector<std::pair<int
         }
     }
 
-    const int64_t n_victims = n_slots - n_warm;
-    const int64_t slot      = n_warm + next_victim;
+    const int64_t n_frames = n_slots - n_warm;
+    const int64_t slot     = n_warm + next_frame;
 
-    next_victim = (next_victim + 1) % n_victims;
+    next_frame = (next_frame + 1) % n_frames;
     slot_expert[slot] = expert;
     n_miss++;
 
@@ -150,7 +150,7 @@ void llama_moe_tier_layer::load_slots(const std::vector<std::pair<int32_t, int32
         return;
     }
 
-    // (slot, expert) x tensor, spread over the readers so the device sees more than one request
+    // (frame, expert) x tensor, spread over the readers so the device sees more than one request
     const size_t n_reads = load.size()*arenas.size();
     const size_t n_threads = std::min<size_t>(LLAMA_MOE_TIER_READERS, n_reads);
 
