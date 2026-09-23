@@ -1800,7 +1800,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // with LLAMA_MOE_HOT the file is larger than RAM by design: pulling all of it into the page
+    // cache at load only evicts what the run actually needs, so let the cache fill from real use
+    const bool prefetch_file = getenv("LLAMA_MOE_HOT") == nullptr && getenv("LLAMA_NO_MMAP_PREFETCH") == nullptr;
+
+    ml.init_mappings(prefetch_file, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2001,6 +2005,23 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
 
     GGML_ASSERT(hot && cold);
     moe_cold[hot] = cold;
+
+    // remember the file ranges that should not sit in the page cache: the hot experts are
+    // copied into VRAM at load and never read again, and the experts past the warm window
+    // are read once per use. Keeping them cached only starves the reads that do repeat.
+    const char * warm_env = getenv("LLAMA_MOE_WARM");
+    const int64_t n_warm = warm_env ? atoll(warm_env) : 0;
+    if (n_warm > 0 && ml.use_mmap) {
+        const size_t expert_size = ggml_nbytes(cold) / (ne2 - n_hot);
+
+        const auto & w_hot = ml.require_weight(tn.str().c_str());
+        moe_cold_tails.push_back({ w_hot.idx, w_hot.offs, w_hot.offs + n_hot*expert_size });
+
+        if (n_warm < ne2 - n_hot) {
+            const auto & w = ml.require_weight(tn_cold.str().c_str());
+            moe_cold_tails.push_back({ w.idx, w.offs + n_warm*expert_size, w.offs + (ne2 - n_hot)*expert_size });
+        }
+    }
 
     LLAMA_LOG_DEBUG("%s: %s split into %lld hot and %lld cold experts\n", __func__, tn.str().c_str(), (long long) n_hot, (long long) (ne2 - n_hot));
 
@@ -3367,6 +3388,30 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+
+void llama_model::trim_moe_cache() const {
+    if (moe_cold_tails.empty()) {
+        return;
+    }
+
+    static int reported = 0;
+    if (!reported) {
+        reported = 1;
+        size_t total = 0;
+        for (const auto & tail : moe_cold_tails) {
+            total += tail.last - tail.first;
+        }
+        LLAMA_LOG_INFO("%s: dropping %zu ranges, %.1f GiB, from the page cache\n",
+                __func__, moe_cold_tails.size(), total/1024.0/1024.0/1024.0);
+    }
+
+    auto & mappings = const_cast<llama_model *>(this)->pimpl->mappings;
+    for (const auto & tail : moe_cold_tails) {
+        if (tail.file_idx < mappings.size()) {
+            mappings[tail.file_idx]->drop_pages(tail.first, tail.last);
+        }
+    }
+}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

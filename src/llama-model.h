@@ -733,6 +733,13 @@ struct llama_model {
     // cold parts of MoE expert tensors split by LLAMA_MOE_HOT
     llm_moe_cold_map moe_cold;
 
+    // file ranges of the cold experts past the warm window (LLAMA_MOE_WARM)
+    struct moe_cold_tail { uint16_t file_idx; size_t first; size_t last; };
+    std::vector<moe_cold_tail> moe_cold_tails;
+
+    // drop the cold tail from the page cache, see llama_mmap::drop_pages
+    void trim_moe_cache() const;
+
     // for keeping track of associated LoRA adapters
     std::unordered_set<llama_adapter_lora *> loras;
 

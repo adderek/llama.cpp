@@ -1593,6 +1593,78 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+
+#if defined(__linux__) || defined(__APPLE__)
+#include <sys/mman.h>
+
+// Ask the kernel for the weights of the experts this call needs, all at once.
+// A file-backed expert is read by page faults otherwise, 64 KiB at a time and one after
+// the other, which leaves an NVMe at a fraction of its bandwidth.
+//
+// GGML_MMID_PREFETCH=1        read the experts of this call in whole slabs
+// GGML_MMID_WARM=N            keep only the first N experts cached; drop the rest after use,
+//                             so the page cache stays small and reads do not wait for reclaim
+// Both off by default. The experts must be sorted by use for WARM to mean anything.
+static int ggml_mmid_prefetch_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        const char * env = getenv("GGML_MMID_PREFETCH");
+        enabled = env && atoi(env) != 0;
+    }
+    return enabled;
+}
+
+static int64_t ggml_mmid_warm_experts(void) {
+    static int64_t warm = -1;
+    if (warm == -1) {
+        const char * env = getenv("GGML_MMID_WARM");
+        warm = env ? atoll(env) : 0;
+    }
+    return warm;
+}
+
+static void ggml_mul_mat_id_advise(const struct ggml_tensor * src0, const int64_t * row_counts, int64_t n_as, int advice, int64_t first) {
+
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+
+    for (int64_t i02 = first; i02 < n_as; ++i02) {
+        if (row_counts[i02] == 0) {
+            continue;
+        }
+        // madvise needs a page-aligned start, tensor data is only aligned to 32 bytes
+        const uintptr_t start = (uintptr_t) src0->data + i02*src0->nb[2];
+        const uintptr_t beg   = start & ~(uintptr_t)(page - 1);
+#ifdef __linux__
+        // glibc ignores POSIX_MADV_DONTNEED, so use madvise directly
+        madvise((void *) beg, (start - beg) + src0->nb[2], advice);
+#else
+        posix_madvise((void *) beg, (start - beg) + src0->nb[2], advice);
+#endif
+    }
+}
+
+static void ggml_mul_mat_id_prefetch(const struct ggml_tensor * src0, const int64_t * row_counts, int64_t n_as) {
+    if (ggml_mmid_prefetch_enabled()) {
+        ggml_mul_mat_id_advise(src0, row_counts, n_as, MADV_WILLNEED, 0);
+    }
+}
+
+// drop the experts that are past the warm window, they were read from disk for this token only
+static void ggml_mul_mat_id_evict(const struct ggml_tensor * src0, const int64_t * row_counts, int64_t n_as) {
+    const int64_t warm = ggml_mmid_warm_experts();
+    if (warm > 0 && warm < n_as) {
+        ggml_mul_mat_id_advise(src0, row_counts, n_as, MADV_DONTNEED, warm);
+    }
+}
+#else
+static void ggml_mul_mat_id_prefetch(const struct ggml_tensor * src0, const int64_t * row_counts, int64_t n_as) {
+    GGML_UNUSED(src0); GGML_UNUSED(row_counts); GGML_UNUSED(n_as);
+}
+static void ggml_mul_mat_id_evict(const struct ggml_tensor * src0, const int64_t * row_counts, int64_t n_as) {
+    GGML_UNUSED(src0); GGML_UNUSED(row_counts); GGML_UNUSED(n_as);
+}
+#endif
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1709,6 +1781,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
+    if (ith == 0) {
+        ggml_mul_mat_id_prefetch(src0, matrix_row_counts, n_as);
+    }
+
     // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
@@ -1780,6 +1856,13 @@ static void ggml_compute_forward_mul_mat_id(
             }
 
             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
+        }
+    }
+
+    if (ggml_mmid_warm_experts() > 0) {
+        ggml_barrier(params->threadpool);
+        if (ith == 0) {
+            ggml_mul_mat_id_evict(src0, matrix_row_counts, n_as);
         }
     }
 }

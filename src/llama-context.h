@@ -388,6 +388,9 @@ private:
 
     bool has_evaluated_once = false;
 
+    // decodes since the last llama_model::trim_moe_cache
+    int32_t n_decode_since_trim = 0;
+
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 

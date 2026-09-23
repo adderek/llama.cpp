@@ -2094,6 +2094,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
+    // keep the page cache from growing into the cold experts, see llama_model::trim_moe_cache
+    static const int32_t trim_every = getenv("LLAMA_MOE_TRIM_EVERY") ? atoi(getenv("LLAMA_MOE_TRIM_EVERY")) : 8;
+    if (++n_decode_since_trim >= trim_every) {
+        n_decode_since_trim = 0;
+        model.trim_moe_cache();
+    }
+
     return 0;
 }
 
