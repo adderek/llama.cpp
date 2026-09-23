@@ -194,6 +194,17 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
+    # fork: MoE expert tiering (LLAMA_MOE_HOT, LLAMA_MOE_DIRECT, tools/moe-tier)
+    set(MOE_TIER_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-moe-tier/")
+    file(MAKE_DIRECTORY "${MOE_TIER_DIR}")
+    llama_build(test-moe-tier.cpp)
+    llama_test(test-moe-tier ARGS "${MOE_TIER_DIR}")
+    find_program(UV_EXECUTABLE uv)
+    if (UV_EXECUTABLE)
+        set_tests_properties(test-moe-tier PROPERTIES
+            ENVIRONMENT "TEST_MOE_TIER_PERMUTE=${CMAKE_CURRENT_SOURCE_DIR}/test-moe-tier-permute.sh")
+    endif()
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
