@@ -2477,7 +2477,9 @@ llm_graph_params llama_context::graph_params(
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
-        /*.moe_cold    =*/ model.moe_cold.empty() ? nullptr : &model.moe_cold,
+        /*.moe_cold    =*/ model.moe_cold.empty()  ? nullptr : &model.moe_cold,
+        /*.moe_arena   =*/ model.moe_arena.empty() ? nullptr : &model.moe_arena,
+        /*.moe_tier    =*/ model.moe_tier.empty()  ? nullptr : &model.moe_tier,
     };
 }
 

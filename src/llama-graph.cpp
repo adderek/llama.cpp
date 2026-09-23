@@ -1,4 +1,5 @@
 #include "llama-graph.h"
+#include "llama-moe-tier.h"
 
 #include "llama-impl.h"
 #include "llama-model.h"
@@ -1490,6 +1491,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     moe_cold         (params.moe_cold),
+    moe_arena        (params.moe_arena),
+    moe_tier         (params.moe_tier),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2157,8 +2160,43 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * exps_hot = build_moe_ffn_exps(cur, ids_hot, selected_experts,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, gate_up_exps, gate_up_exps_b,
                 nullptr, nullptr, nullptr, type_op, il, true);
+        // decoding can go through the RAM arena instead of the mmap: one token routes to at
+        // most n_expert_used experts per layer, so a streamed expert cannot be evicted while
+        // this call still needs it. Prompt processing touches every expert and stays on the mmap.
+        ggml_tensor * cold_up   = cold(up_exps);
+        ggml_tensor * cold_gate = cold(gate_exps);
+        ggml_tensor * cold_gup  = cold(gate_up_exps);
+        ggml_tensor * cold_down = down_cold;
+
+        if (moe_arena && moe_tier) {
+            const auto it_arena = moe_arena->find(down_cold);
+            const auto it_tier  = moe_tier->find(down_cold);
+            // a streamed expert must not be evicted while this call still needs it, so the
+            // ubatch may not route to more experts than there are victim slots
+            const bool fits = it_tier != moe_tier->end() &&
+                n_tokens*selected_experts->ne[0] <= it_tier->second->n_slots - it_tier->second->n_warm;
+            if (it_arena != moe_arena->end() && fits) {
+                auto arena = [&](ggml_tensor * t) -> ggml_tensor * {
+                    if (t == nullptr) {
+                        return nullptr;
+                    }
+                    const auto it = moe_arena->find(t);
+                    GGML_ASSERT(it != moe_arena->end());
+                    return it->second;
+                };
+
+                ids_cold  = ggml_map_custom1(ctx0, ids_cold, llama_moe_tier_map_ids, 1, it_tier->second);
+                cb(ids_cold, "ffn_moe_topk_arena", il);
+
+                cold_up   = arena(cold_up);
+                cold_gate = arena(cold_gate);
+                cold_gup  = arena(cold_gup);
+                cold_down = it_arena->second;
+            }
+        }
+
         ggml_tensor * exps_cold = build_moe_ffn_exps(cur, ids_cold, selected_experts,
-                cold(up_exps), up_exps_b, cold(gate_exps), gate_exps_b, down_cold, down_exps_b, cold(gate_up_exps), gate_up_exps_b,
+                cold_up, up_exps_b, cold_gate, gate_exps_b, cold_down, down_exps_b, cold_gup, gate_up_exps_b,
                 nullptr, nullptr, nullptr, type_op, il, true);
 
         experts = ggml_add(ctx0, exps_hot, exps_cold);
