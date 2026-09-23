@@ -145,6 +145,10 @@ def cmd_permute(args) -> None:
             continue
         vtype = field.types[0]
         sub = field.types[-1] if vtype == gguf.GGUFValueType.ARRAY else None
+        if vtype == gguf.GGUFValueType.ARRAY and len(field.data) == 0:
+            # GGUFWriter refuses empty arrays; an absent key reads the same to llama.cpp
+            log(f"note: dropping empty array {field.name}")
+            continue
         writer.add_key_value(field.name, field.contents(), vtype, sub_type=sub)
     writer.add_bool("moe_tier.permuted", True)
     writer.add_string("moe_tier.imatrix", os.path.basename(args.imatrix))
