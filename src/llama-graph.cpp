@@ -2173,16 +2173,36 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             // ubatch may not route to more experts than there are replaceable frames
             const bool fits = it_tier != moe_tier->end() &&
                 n_tokens*selected_experts->ne[0] <= it_tier->second->n_slots - it_tier->second->n_warm;
-            if (it_arena != moe_arena->end() && fits) {
-                auto arena = [&](ggml_tensor * t) -> ggml_tensor * {
-                    if (t == nullptr) {
-                        return nullptr;
-                    }
-                    const auto it = moe_arena->find(t);
-                    GGML_ASSERT(it != moe_arena->end());
-                    return it->second;
-                };
+            auto arena = [&](ggml_tensor * t) -> ggml_tensor * {
+                if (t == nullptr) {
+                    return nullptr;
+                }
+                const auto it = moe_arena->find(t);
+                GGML_ASSERT(it != moe_arena->end());
+                return it->second;
+            };
+            if (it_arena != moe_arena->end() && !fits) {
+                // too many experts for the frames: one pass per window of cold ids, each window paged in
+                // after the pass before it is done with the frames
+                ggml_tensor * exps_cold = nullptr;
+                ggml_tensor * prev      = ids_cold;
+                for (auto & w : it_tier->second->windows) {
+                    ggml_tensor * ids_w = ggml_map_custom2(ctx0, ids_cold, prev, llama_moe_tier_map_window, 1, &w);
+                    cb(ids_w, "ffn_moe_topk_window", il);
 
+                    ggml_tensor * out = build_moe_ffn_exps(cur, ids_w, selected_experts,
+                            arena(cold_up), up_exps_b, arena(cold_gate), gate_exps_b, it_arena->second, down_exps_b,
+                            arena(cold_gup), gate_up_exps_b, nullptr, nullptr, nullptr, type_op, il, true);
+
+                    exps_cold = exps_cold ? ggml_add(ctx0, exps_cold, out) : out;
+                    // one element is enough to order the next window after this pass
+                    prev = ggml_sum(ctx0, ggml_view_1d(ctx0, out, 1, 0));
+                }
+
+                experts = ggml_add(ctx0, exps_hot, exps_cold);
+                cb(experts, "ffn_moe_down_merged", il);
+            }
+            if (it_arena != moe_arena->end() && fits) {
                 ids_cold  = ggml_map_custom1(ctx0, ids_cold, llama_moe_tier_map_ids, 1, it_tier->second);
                 cb(ids_cold, "ffn_moe_topk_arena", il);
 
@@ -2193,12 +2213,14 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
 
-        ggml_tensor * exps_cold = build_moe_ffn_exps(cur, ids_cold, selected_experts,
-                cold_up, up_exps_b, cold_gate, gate_exps_b, cold_down, down_exps_b, cold_gup, gate_up_exps_b,
-                nullptr, nullptr, nullptr, type_op, il, true);
+        if (experts == nullptr) {
+            ggml_tensor * exps_cold = build_moe_ffn_exps(cur, ids_cold, selected_experts,
+                    cold_up, up_exps_b, cold_gate, gate_exps_b, cold_down, down_exps_b, cold_gup, gate_up_exps_b,
+                    nullptr, nullptr, nullptr, type_op, il, true);
 
-        experts = ggml_add(ctx0, exps_hot, exps_cold);
-        cb(experts, "ffn_moe_down_merged", il);
+            experts = ggml_add(ctx0, exps_hot, exps_cold);
+            cb(experts, "ffn_moe_down_merged", il);
+        }
     }
 
     if (!weight_before_ffn) {
