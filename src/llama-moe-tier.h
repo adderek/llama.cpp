@@ -84,6 +84,7 @@ void llama_moe_tier_map_ids(struct ggml_tensor * dst, const struct ggml_tensor *
 // ggml custom op for ubatches that route to more experts than there are frames: keep the
 // ids of one window, rewritten to frames, and page that window in. `b` is only there to
 // order this op after the pass over the previous window, which still reads the frames.
+// Windows after the first get ids relative to the first frame, see the graph.
 // userdata is a llama_moe_tier_layer::window.
 void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata);
 
