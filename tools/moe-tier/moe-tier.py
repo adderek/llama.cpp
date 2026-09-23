@@ -109,6 +109,7 @@ def cmd_permute(args) -> None:
 
     plan: dict[str, int] = {}  # tensor name -> layer whose order applies
     suspicious = []
+    skipped_layers: set[int] = set()
     for t in reader.tensors:
         m = LAYER_RE.match(t.name)
         if not m:
@@ -118,13 +119,18 @@ def cmd_permute(args) -> None:
             if t.data.shape[0] != n_expert:
                 sys.exit(f"{t.name}: outer dim {t.data.shape[0]} != n_expert {n_expert}")
             if il not in orders:
-                sys.exit(f"{t.name}: per-expert tensor but the imatrix has no counts for layer {il}")
+                # a layer the imatrix run never reached, e.g. an MTP block; leave it as it is,
+                # each layer's experts and router are permuted together or not at all
+                skipped_layers.add(il)
+                continue
             plan[t.name] = il
         elif n_expert in t.data.shape:
             suspicious.append(t.name)
     missing = sorted(set(orders) - {il for il in plan.values()})
     if missing:
         sys.exit(f"imatrix has expert counts for layers {missing} but the model has no per-expert tensors there")
+    if skipped_layers:
+        log(f"note: layers {sorted(skipped_layers)} have experts but no imatrix counts, left unpermuted")
     if suspicious:
         # not fatal: n_expert can coincide with an ordinary dimension (head_dim 256, ...);
         # the logit-equality test is what proves nothing else is indexed by expert id

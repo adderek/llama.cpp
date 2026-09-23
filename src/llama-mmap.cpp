@@ -480,11 +480,13 @@ static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t li
 struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
+    int file_fd = -1;
 
     impl(struct llama_file * file, size_t prefetch, bool numa, bool hugetlb,
          const llama_mmap::ranges & lazy_ranges) {
         size = file->size();
         int fd = file->file_id();
+        file_fd = fd;
 #ifdef __linux__
         if (hugetlb) {
             // Anonymous hugetlb mapping rounded up to 2 MiB. PROT_WRITE lets
@@ -569,6 +571,31 @@ struct llama_mmap::impl {
 
         if (*last <= *first) {
             *last = *first;
+        }
+    }
+
+    // let the kernel reuse the pages of [first, last): unmap them first, a mapped page
+    // cannot be dropped from the page cache. keeps the cache from growing past what the
+    // run really reuses, so faults do not have to wait for reclaim
+    void drop_pages(size_t first, size_t last) {
+        size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+        align_range(&first, &last, page_size);
+        if (last <= first || is_hugetlb_) {
+            return;
+        }
+
+#ifdef __linux__
+        if (madvise((uint8_t *) addr + first, last - first, MADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: madvise(MADV_DONTNEED) failed: %s\n", strerror(errno));
+            return;
+        }
+#else
+        if (posix_madvise((uint8_t *) addr + first, last - first, POSIX_MADV_DONTNEED)) {
+            return;
+        }
+#endif
+        if (file_fd != -1) {
+            posix_fadvise(file_fd, first, last - first, POSIX_FADV_DONTNEED);
         }
     }
 
@@ -671,6 +698,10 @@ struct llama_mmap::impl {
         }
     }
 
+    void drop_pages(size_t first, size_t last) {
+        GGML_UNUSED(first); GGML_UNUSED(last);
+    }
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -702,6 +733,10 @@ struct llama_mmap::impl {
         throw std::runtime_error("mmap not supported");
     }
 
+    void drop_pages(size_t first, size_t last) {
+        GGML_UNUSED(first); GGML_UNUSED(last);
+    }
+
     void unmap_fragment(size_t first, size_t last) {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
@@ -728,6 +763,7 @@ void * llama_mmap::addr() const { return pimpl->addr; }
 bool   llama_mmap::is_hugetlb() const { return pimpl->is_hugetlb_; }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
+void llama_mmap::drop_pages(size_t first, size_t last) { pimpl->drop_pages(first, last); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mmap::SUPPORTED  = true;
