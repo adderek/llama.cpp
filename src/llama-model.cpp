@@ -2087,6 +2087,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
             moe_tier_layers.back()->bid = tn.bid;
             moe_tier_layers.back()->init(n_warm, n_slots);
             moe_tier_layers.back()->n_cold = n_cold;
+            moe_tier_layers.back()->init_windows();
         }
 
         auto * layer = moe_tier_layers.back().get();

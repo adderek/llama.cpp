@@ -21,6 +21,13 @@
 // than there are replaceable frames, so a paged-in expert cannot be replaced while the
 // call still needs it.
 struct llama_moe_tier_layer {
+    // a window of cold ids that one pass of the chunked (prefill) path pages into the frames
+    struct window {
+        llama_moe_tier_layer * layer;
+        int32_t lo; // first cold id of the window
+        int32_t hi; // one past the last
+    };
+
     struct arena {
         uint8_t * data = nullptr; // arena base, holds n_slots experts
         size_t    slab = 0;       // bytes per expert
@@ -36,6 +43,9 @@ struct llama_moe_tier_layer {
     std::vector<arena>   arenas;      // one per expert tensor of the layer
     std::vector<int32_t> slot_expert; // which expert each frame holds, -1 if none
     int64_t              next_frame = 0;
+
+    // [0, n_slots), then n_slots - n_warm ids at a time; fixed after init so the graph can point at them
+    std::vector<window>  windows;
 
     std::vector<struct ggml_tensor *> pending; // arenas whose data pointer is known only after load
 
@@ -53,6 +63,9 @@ struct llama_moe_tier_layer {
 
     void init(int64_t n_warm, int64_t n_slots);
 
+    // needs n_cold
+    void init_windows();
+
     // called once the arena buffer is allocated: bind the data pointers and read the
     // warm experts from the file
     void finalize(int fd);
@@ -67,6 +80,12 @@ struct llama_moe_tier_layer {
 // ggml custom op: rewrite cold expert ids into arena slots, loading what is missing.
 // userdata is the llama_moe_tier_layer of this layer.
 void llama_moe_tier_map_ids(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata);
+
+// ggml custom op for ubatches that route to more experts than there are frames: keep the
+// ids of one window, rewritten to frames, and page that window in. `b` is only there to
+// order this op after the pass over the previous window, which still reads the frames.
+// userdata is a llama_moe_tier_layer::window.
+void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tensor * a, const struct ggml_tensor * b, int ith, int nth, void * userdata);
 
 // open a second handle to the file behind fd, with O_DIRECT; -1 if that is not possible
 int llama_moe_tier_open_direct(int fd);
