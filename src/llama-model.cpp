@@ -40,6 +40,11 @@
 #include <string>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <cerrno>
+#endif
+
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
     switch (arch) {
         case LLM_ARCH_CLIP:
@@ -1972,6 +1977,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             for (auto & layer : moe_tier_layers) {
                 layer->finalize(fd);
             }
+#if defined(__linux__)
+            // the arena is anonymous memory: unpinned, reclaim swaps it out before it drops
+            // page cache, and a frame read back from swap costs more than one read from the file
+            {
+                void * base = ggml_backend_buffer_get_base(moe_arena_buf.get());
+                const size_t size = ggml_backend_buffer_get_size(moe_arena_buf.get());
+                if (mlock(base, size) == 0) {
+                    LLAMA_LOG_INFO("%s: MoE arena locked in RAM\n", __func__);
+                } else {
+                    LLAMA_LOG_WARN("%s: could not mlock the MoE arena (%s), raise RLIMIT_MEMLOCK\n", __func__, strerror(errno));
+                }
+            }
+#endif
             LLAMA_LOG_INFO("%s: MoE arena: %lld pinned + %lld paged frames per layer\n",
                     __func__, (long long) moe_tier_layers[0]->n_warm,
                     (long long) (moe_tier_layers[0]->n_slots - moe_tier_layers[0]->n_warm));
