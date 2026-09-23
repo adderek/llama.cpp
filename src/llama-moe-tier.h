@@ -7,17 +7,19 @@
 #include <utility>
 #include <vector>
 
-// Cold experts of one MoE layer, kept in a RAM arena instead of an mmap.
+// Demand paging for the cold experts of one MoE layer, with the model file as the
+// backing store and the arena as the page frames.
 //
-// The arena holds the first n_warm experts, which are the most used ones after the
-// model has been through tools/moe-tier, plus a few slots for the rest. An expert that
-// is not in the arena is read straight from the file with O_DIRECT, so it never enters
-// the page cache: a fault on a full page cache costs 18.7 ms per 2 MiB, a direct read
-// of the same 2 MiB costs 0.54 ms.
+// The first n_warm frames are pinned: they hold the experts the router uses most,
+// which tools/moe-tier has sorted to the front. The frames after them are replaced
+// round-robin, and an expert that is not resident is paged in with O_DIRECT, so it
+// never enters the page cache: a fault on a full page cache costs 18.7 ms per 2 MiB,
+// a direct read of the same 2 MiB costs 0.54 ms.
 //
-// Used for decoding only, where a token routes to at most n_expert_used experts per
-// layer and the victim slots cannot be needed twice in one call. Prompt processing
-// touches every expert anyway and keeps using the mmap.
+// This is not a victim cache: nothing is evicted from a level above, experts are
+// fetched on demand. The graph only uses it when the ubatch routes to no more experts
+// than there are replaceable frames, so a paged-in expert cannot be replaced while the
+// call still needs it.
 struct llama_moe_tier_layer {
     struct arena {
         uint8_t * data = nullptr; // arena base, holds n_slots experts
@@ -32,8 +34,8 @@ struct llama_moe_tier_layer {
     int64_t n_slots = 0;
 
     std::vector<arena>   arenas;      // one per expert tensor of the layer
-    std::vector<int32_t> slot_expert; // which expert each victim slot holds, -1 if none
-    int64_t              next_victim = 0;
+    std::vector<int32_t> slot_expert; // which expert each frame holds, -1 if none
+    int64_t              next_frame = 0;
 
     std::vector<struct ggml_tensor *> pending; // arenas whose data pointer is known only after load
 
@@ -41,7 +43,7 @@ struct llama_moe_tier_layer {
     std::vector<std::vector<uint8_t>> bounce;
     std::vector<uint8_t *>            bounce_aligned;
 
-    int64_t n_miss = 0; // experts read from the file so far
+    int64_t n_miss = 0; // experts paged in from the file so far
     int64_t n_hit  = 0;
     int64_t n_slot_total = 0; // routed slots seen, including the ones served from VRAM
     int64_t n_slot_hot   = 0; // slots that belong to the hot half
@@ -55,10 +57,10 @@ struct llama_moe_tier_layer {
     // warm experts from the file
     void finalize(int fd);
 
-    // arena slot for this expert; a slot that still has to be read is added to `load`
+    // frame holding this expert; a frame that still has to be paged in is added to `load`
     int32_t slot_for(int32_t expert, std::vector<std::pair<int32_t, int32_t>> & load);
 
-    // read the queued (slot, expert) pairs, several at a time
+    // page in the queued (frame, expert) pairs, several at a time
     void load_slots(const std::vector<std::pair<int32_t, int32_t>> & load);
 };
 

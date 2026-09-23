@@ -2221,9 +2221,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * exps_hot = build_moe_ffn_exps(cur, ids_hot, selected_experts,
                 up_exps, up_exps_b, gate_exps, gate_exps_b, down_exps, down_exps_b, gate_up_exps, gate_up_exps_b,
                 nullptr, nullptr, nullptr, type_op, il, true);
-        // decoding can go through the RAM arena instead of the mmap: one token routes to at
-        // most n_expert_used experts per layer, so a streamed expert cannot be evicted while
-        // this call still needs it. Prompt processing touches every expert and stays on the mmap.
+        // the cold half can come from the RAM arena instead of the mmap, see llama-moe-tier.h
         ggml_tensor * cold_up   = cold(up_exps);
         ggml_tensor * cold_gate = cold(gate_exps);
         ggml_tensor * cold_gup  = cold(gate_up_exps);
@@ -2232,8 +2230,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         if (moe_arena && moe_tier) {
             const auto it_arena = moe_arena->find(down_cold);
             const auto it_tier  = moe_tier->find(down_cold);
-            // a streamed expert must not be evicted while this call still needs it, so the
-            // ubatch may not route to more experts than there are victim slots
+            // a paged-in expert must not be replaced while this call still needs it, so the
+            // ubatch may not route to more experts than there are replaceable frames
             const bool fits = it_tier != moe_tier->end() &&
                 n_tokens*selected_experts->ne[0] <= it_tier->second->n_slots - it_tier->second->n_warm;
             if (it_arena != moe_arena->end() && fits) {
