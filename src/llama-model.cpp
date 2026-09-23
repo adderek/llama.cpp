@@ -1952,6 +1952,32 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    LLAMA_LOG_INFO("%s: moe_tier_layers=%zu at end of load_tensors\n", __func__, moe_tier_layers.size());
+    if (!moe_tier_layers.empty()) {
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        moe_arena_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(moe_arena_ctx.get(), ggml_backend_dev_buffer_type(cpu_dev)));
+        if (moe_arena_buf) {
+            ggml_backend_buffer_set_usage(moe_arena_buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            LLAMA_LOG_INFO("%s: MoE arena buffer size = %8.2f MiB\n", __func__,
+                    ggml_backend_buffer_get_size(moe_arena_buf.get())/1024.0/1024.0);
+        }
+
+        const int fd = moe_arena_buf ? llama_moe_tier_open_direct(ml.files[0]->file_id()) : -1;
+        if (fd == -1) {
+            LLAMA_LOG_WARN("%s: no O_DIRECT handle for the model file, LLAMA_MOE_DIRECT is off\n", __func__);
+            moe_arena.clear();
+            moe_tier.clear();
+            moe_tier_layers.clear();
+        } else {
+            for (auto & layer : moe_tier_layers) {
+                layer->finalize(fd);
+            }
+            LLAMA_LOG_INFO("%s: MoE arena: %lld warm + %lld streamed experts per layer\n",
+                    __func__, (long long) moe_tier_layers[0]->n_warm,
+                    (long long) (moe_tier_layers[0]->n_slots - moe_tier_layers[0]->n_warm));
+        }
+    }
+
     return true;
 }
 
@@ -2005,6 +2031,55 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
 
     GGML_ASSERT(hot && cold);
     moe_cold[hot] = cold;
+
+    // LLAMA_MOE_DIRECT: a RAM arena for the cold experts, read with O_DIRECT on a miss
+    const char * direct_env = getenv("LLAMA_MOE_DIRECT");
+    if (direct_env && atoi(direct_env) != 0 && !ml.files.empty()) {
+        // LLAMA_MOE_ARENA is how many experts the arena keeps in RAM; it is separate from
+        // LLAMA_MOE_WARM, which says how much of the mmap is worth keeping in the page cache
+        const char * arena_env   = getenv("LLAMA_MOE_ARENA");
+        const char * warm_env    = getenv("LLAMA_MOE_WARM");
+        const char * victims_env = getenv("LLAMA_MOE_VICTIMS");
+
+        const int64_t n_cold    = ne2 - n_hot;
+        const int64_t n_victims = victims_env ? atoll(victims_env) : 32;
+        const int64_t n_warm    = std::min<int64_t>(arena_env ? atoll(arena_env) : (warm_env ? atoll(warm_env) : n_cold/2), n_cold - n_victims);
+        const int64_t n_slots   = n_warm + n_victims;
+
+        GGML_ASSERT(n_warm > 0 && n_slots <= n_cold);
+
+        // the arena is ours, not the loader's: the model mmap is read-only and shared, and
+        // streaming an expert means writing into the arena
+        if (!moe_arena_ctx) {
+            ggml_init_params ip = {
+                /*.mem_size   =*/ ggml_tensor_overhead()*hparams.n_layer_all*8,
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            moe_arena_ctx.reset(ggml_init(ip));
+        }
+
+        const LLM_TN_IMPL tn_arena(tn.arch, tn.tensor, "weight.cold.arena", tn.bid, tn.xid);
+
+        ggml_tensor * arena = ggml_new_tensor_3d(moe_arena_ctx.get(), cold->type, ne0, ne1, n_slots);
+        ggml_set_name(arena, tn_arena.str().c_str());
+
+        if (moe_tier_layers.empty() || moe_tier_layers.back()->bid != tn.bid) {
+            moe_tier_layers.emplace_back(new llama_moe_tier_layer());
+            moe_tier_layers.back()->bid = tn.bid;
+            moe_tier_layers.back()->init(n_warm, n_slots);
+            moe_tier_layers.back()->n_cold = n_cold;
+        }
+
+        auto * layer = moe_tier_layers.back().get();
+        const auto & w_cold = ml.require_weight(tn_cold.str().c_str());
+        layer->arenas.push_back({ nullptr, ggml_nbytes(arena) / n_slots, w_cold.offs });
+        layer->pending.push_back(arena);
+
+        moe_arena[cold] = arena;
+        moe_tier[cold]  = layer;
+        LLAMA_LOG_INFO("%s: arena for layer %d, %lld slots\n", __func__, tn.bid, (long long) n_slots);
+    }
 
     // remember the file ranges that should not sit in the page cache: the hot experts are
     // copied into VRAM at load and never read again, and the experts past the warm window
@@ -3390,6 +3465,29 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
 
 void llama_model::trim_moe_cache() const {
+    static const bool stats = getenv("LLAMA_MOE_STATS") != nullptr;
+    if (stats && !moe_tier_layers.empty()) {
+        int64_t hit = 0, miss = 0;
+        for (const auto & l : moe_tier_layers) {
+            hit  += l->n_hit;
+            miss += l->n_miss;
+        }
+        int64_t total = 0, hot = 0, hist[8] = {0};
+        for (const auto & l : moe_tier_layers) {
+            total += l->n_slot_total;
+            hot   += l->n_slot_hot;
+            for (int i = 0; i < 8; ++i) {
+                hist[i] += l->hist[i];
+            }
+        }
+        LLAMA_LOG_INFO("%s: arena %lld hits, %lld streamed; slots %lld, hot %.0f%%; cold eighths %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f %%\n",
+                __func__, (long long) hit, (long long) miss, (long long) total, 100.0*hot/std::max<int64_t>(1, total),
+                100.0*hist[0]/std::max<int64_t>(1,total-hot), 100.0*hist[1]/std::max<int64_t>(1,total-hot),
+                100.0*hist[2]/std::max<int64_t>(1,total-hot), 100.0*hist[3]/std::max<int64_t>(1,total-hot),
+                100.0*hist[4]/std::max<int64_t>(1,total-hot), 100.0*hist[5]/std::max<int64_t>(1,total-hot),
+                100.0*hist[6]/std::max<int64_t>(1,total-hot), 100.0*hist[7]/std::max<int64_t>(1,total-hot));
+    }
+
     if (moe_cold_tails.empty()) {
         return;
     }

@@ -245,6 +245,9 @@ struct llama_model_loader {
     // both stay views of the same file data
     void split_experts(const std::string & name, int64_t n_hot);
 
+    // add a weight `arena_name` that reads the first n_slots experts of `cold_name`
+    void add_expert_arena(const std::string & cold_name, const std::string & arena_name, int64_t n_slots);
+
     void done_getting_tensors(bool partial = false) const;
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);

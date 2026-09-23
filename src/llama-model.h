@@ -3,6 +3,9 @@
 #include "llama.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
+#include "llama-moe-tier.h"
+
+#include "ggml-cpp.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
@@ -732,6 +735,13 @@ struct llama_model {
 
     // cold parts of MoE expert tensors split by LLAMA_MOE_HOT
     llm_moe_cold_map moe_cold;
+
+    // cold experts kept in a RAM arena and read with O_DIRECT (LLAMA_MOE_DIRECT)
+    llm_moe_cold_map moe_arena; // cold tensor -> arena tensor
+    llm_moe_tier_map moe_tier;  // cold tensor -> the layer state the arena belongs to
+    std::vector<std::unique_ptr<llama_moe_tier_layer>> moe_tier_layers;
+    ggml_context_ptr        moe_arena_ctx;
+    ggml_backend_buffer_ptr moe_arena_buf;
 
     // file ranges of the cold experts past the warm window (LLAMA_MOE_WARM)
     struct moe_cold_tail { uint16_t file_idx; size_t first; size_t last; };

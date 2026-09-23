@@ -1139,7 +1139,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             int max_n_tensors = n_tensors;
             max_n_tensors += 1;                   // duplicated output tensor
             max_n_tensors += hparams.n_layer()*2; // duplicated rope freq tensors
-            max_n_tensors += hparams.n_layer_all*3; // cold expert tensors from split_experts
+            max_n_tensors += hparams.n_layer_all*6; // cold and arena expert tensors, see split_experts
             if (files.empty()) {
                 max_n_tensors += hparams.n_layer()*256; // this should be well above what any model actually uses
             }
@@ -1411,7 +1411,7 @@ void llama_model_loader::split_experts(const std::string & name, int64_t n_hot) 
 
     if (!ctx_split) {
         ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead()*2*weights_map.size(),
+            /*.mem_size   =*/ ggml_tensor_overhead()*4*weights_map.size(),
             /*.mem_buffer =*/ NULL,
             /*.no_alloc   =*/ true,
         };
@@ -1434,6 +1434,24 @@ void llama_model_loader::split_experts(const std::string & name, int64_t n_hot) 
 
     it->second = hot;
     weights_map.emplace(name_cold, cold);
+    n_tensors++;
+}
+
+void llama_model_loader::add_expert_arena(const std::string & cold_name, const std::string & arena_name, int64_t n_slots) {
+    const auto it = weights_map.find(cold_name);
+    GGML_ASSERT(it != weights_map.end());
+
+    const llama_tensor_weight cold = it->second;
+    const ggml_tensor * t = cold.tensor;
+    GGML_ASSERT(n_slots > 0 && n_slots <= t->ne[2]);
+
+    ggml_tensor * meta = ggml_new_tensor_3d(ctx_split.get(), t->type, t->ne[0], t->ne[1], n_slots);
+    ggml_set_name(meta, arena_name.c_str());
+
+    llama_tensor_weight arena = cold;
+    arena.tensor = meta;
+
+    weights_map.emplace(arena_name, arena);
     n_tensors++;
 }
 
