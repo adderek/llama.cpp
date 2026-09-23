@@ -2247,13 +2247,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 // after the pass before it is done with the frames
                 ggml_tensor * exps_cold = nullptr;
                 ggml_tensor * prev      = ids_cold;
+                const auto * layer = it_tier->second;
                 for (auto & w : it_tier->second->windows) {
                     ggml_tensor * ids_w = ggml_map_custom2(ctx0, ids_cold, prev, llama_moe_tier_map_window, 1, &w);
                     cb(ids_w, "ffn_moe_topk_window", il);
 
+                    // later windows see only the frames, through a tensor of their own: the scheduler copies
+                    // an offloaded weight once per graph, so a shared tensor would give them window 0's frames
+                    auto frames = [&](ggml_tensor * t) -> ggml_tensor * {
+                        if (t == nullptr || w.lo == 0) {
+                            return t;
+                        }
+                        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], layer->n_slots - layer->n_warm,
+                                t->nb[1], t->nb[2], layer->n_warm*t->nb[2]);
+                    };
+
                     ggml_tensor * out = build_moe_ffn_exps(cur, ids_w, selected_experts,
-                            arena(cold_up), up_exps_b, arena(cold_gate), gate_exps_b, it_arena->second, down_exps_b,
-                            arena(cold_gup), gate_up_exps_b, nullptr, nullptr, nullptr, type_op, il, true);
+                            frames(arena(cold_up)), up_exps_b, frames(arena(cold_gate)), gate_exps_b, frames(it_arena->second), down_exps_b,
+                            frames(arena(cold_gup)), gate_up_exps_b, nullptr, nullptr, nullptr, type_op, il, true);
 
                     exps_cold = exps_cold ? ggml_add(ctx0, exps_cold, out) : out;
                     // one element is enough to order the next window after this pass

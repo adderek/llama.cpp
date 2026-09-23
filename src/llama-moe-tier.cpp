@@ -277,7 +277,8 @@ void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tenso
             } else {
                 layer->n_hit++;
             }
-            dst_row[i0] = slot;
+            // windows after the first index their own view, which starts at the first frame
+            dst_row[i0] = first ? slot : slot - (int32_t) layer->n_warm;
         }
     }
 
