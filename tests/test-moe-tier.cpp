@@ -181,6 +181,7 @@ static std::string g_self;
 
 static bool run(const std::string & env, const std::string & model, const std::string & out, const std::string & dev, int n_ubatch) {
     const std::string cmd = "env LLAMA_MOE_STATS=1 LLAMA_MOE_TRIM_EVERY=1 " + env + " '" + g_self + "' child '" + model + "' '" + out + "' '" + dev + "' " + std::to_string(n_ubatch);
+    remove(out.c_str()); // a child that dies must not leave the previous run's logits to compare
     const int rc = system(cmd.c_str());
     if (rc != 0) {
         fprintf(stderr, "FAIL: child exited with %d: %s\n", rc, cmd.c_str());
@@ -222,7 +223,7 @@ static bool compare(const char * what, const std::string & ref, const std::strin
     }
     const bool same = memcmp(a.data(), b.data(), a.size()*sizeof(float)) == 0;
     const double e = nmse(a, b);
-    const bool ok = exact ? same : e < 1e-6;
+    const bool ok = exact ? same : e < 1e-12; // GPUs are bit-identical here too, save for ~1e-17
     printf("  %-44s %s  nmse %.2e%s\n", what, ok ? "OK  " : "FAIL", e, same ? " (bit-identical)" : "");
     return ok;
 }
