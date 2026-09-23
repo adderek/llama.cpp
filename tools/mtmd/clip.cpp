@@ -3722,7 +3722,10 @@ struct clip_model_loader {
     // only initialize backend buffers, but do not allocate them yet
     static support_info_graph reserve_compute_meta(clip_ctx & ctx_clip, const clip_image_f32_batch & batch) {
         ggml_cgraph * gf = clip_get_graph_builder(&ctx_clip, batch)->build();
-        ggml_backend_sched_reserve(ctx_clip.sched.get(), gf);
+        // an encoder without its compute buffers crashes on the first image, so fail the load instead
+        if (!ggml_backend_sched_reserve(ctx_clip.sched.get(), gf)) {
+            throw std::runtime_error("failed to allocate the encoder compute buffers (out of device memory?)");
+        }
 
         ctx_clip.mem_compute.clear();
         for (size_t i = 0; i < ctx_clip.backend_ptrs.size(); ++i) {
@@ -4378,7 +4381,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
-        clip_model_loader::warmup(*ctx, *params->imgs);
+        try {
+            clip_model_loader::warmup(*ctx, *params->imgs);
+        } catch (const std::exception & e) {
+            LOG_ERR("%s: %s\n", __func__, e.what());
+            return false;
+        }
     }
 
     if (params->seed != ctx->rng_seed) {
@@ -4389,7 +4397,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     // build the inference graph
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
-    ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched.get(), gf)) {
+        LOG_ERR("%s: failed to allocate the encoder graph (out of device memory?)\n", __func__);
+        return false;
+    }
 
     // set inputs
     const auto & model   = ctx->model;
