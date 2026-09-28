@@ -1,8 +1,8 @@
 #include "ssm-scan.cuh"
 
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070
+#if !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 #define USE_CUB
-#endif // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070
+#endif // !defined(GGML_USE_HIP) && (defined(GGML_USE_MUSA) || CUDART_VERSION >= 11070)
 
 #ifdef USE_CUB
 #   if defined(GGML_USE_HIP)
