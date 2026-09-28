@@ -336,6 +336,7 @@ endif()
 llama_build(test-backend-ops.cpp)
 
 llama_build_and_test(test-tiled-mulmat.cpp)
+llama_build_and_test(test-op-offload-devices.cpp) # fork: GGML_CUDA_OP_OFFLOAD_DEVICES
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

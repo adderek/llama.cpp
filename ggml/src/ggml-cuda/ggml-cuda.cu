@@ -90,6 +90,7 @@
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
+#include <climits>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -6025,6 +6026,27 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                     c = std::tolower(c);
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+
+                // fork: GGML_CUDA_OP_OFFLOAD_DEVICES=1,2 limits op offload (large-batch ops whose
+                // weights sit in host RAM, e.g. MoE experts) to those devices. The scheduler takes
+                // the first capable device, so on a box whose device 0 hangs off a narrow chipset
+                // link every expert weight crosses the slow bus: 195 -> 646 t/s prefill measured
+                // by moving it to the x16 card.
+                if (const char * allowed = getenv("GGML_CUDA_OP_OFFLOAD_DEVICES")) {
+                    bool found = false;
+                    for (const char * p = allowed; *p; ) {
+                        char * end = nullptr;
+                        const long id = strtol(p, &end, 10);
+                        if (end == p) {
+                            break;
+                        }
+                        found = found || id == i;
+                        p = *end == ',' ? end + 1 : end;
+                    }
+                    if (!found) {
+                        dev_ctx->op_offload_min_batch_size = INT_MAX;
+                    }
+                }
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,
