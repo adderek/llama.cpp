@@ -5,6 +5,7 @@
 #include "llama-io.h"
 #include "llama-model.h"
 
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -50,6 +51,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
 
+        // the cached indexer keys are raw, rotation happens after pooling at read time, so a
+        // K-shift must not rotate them while the stream copies in the same update still apply
+        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
+
+        // fool llama_kv_cache into thinking this is a MLA cache, so it won't cache V tensors
+        hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
+        hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
+
         // The indexer keys are read back with GET_ROWS and then normed and roped, so they must
         // stay in the model space. TurboQuant stores them WHT-rotated and has no GET_ROWS
         // support, so fall back to f16 for this cache.
@@ -63,10 +72,6 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
             LLAMA_LOG_INFO("%s: indexer KV cache does not support turbo types, using %s\n",
                     __func__, ggml_type_name(idx_type_k));
         }
-
-        // the cached indexer keys are raw, rotation happens after pooling at read time, so a
-        // K-shift must not rotate them while the stream copies in the same update still apply
-        hparams_idx.rope_type = LLAMA_ROPE_TYPE_NONE;
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
@@ -279,97 +284,17 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
 }
 
-//
-// llama_memory_hybrid_idx_context
-//
-
-// streams in each ubatch's slot info, matching get_k/get_v's `ns`
-static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
-    std::vector<uint32_t> res;
-    res.reserve(sinfos.size());
-
-    for (const auto & sinfo : sinfos) {
-        res.push_back(sinfo.s1 - sinfo.s0 + 1);
-    }
-
-    return res;
-}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
-    llama_memory_hybrid_context(status) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
-    llama_memory_hybrid_context(mem),
-    mem(mem),
-    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
-    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
-    ns_ubatch(mem->get_mem_idx() == nullptr ?
-        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
-        llama_memory_hybrid_idx * mem,
-                  llama_context * lctx,
-                           bool   optimize) :
-    llama_memory_hybrid_context(mem, lctx, optimize),
-    mem(mem),
-    // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
-
-llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
-        llama_memory_hybrid_idx * mem,
-                slot_info_vec_t   sinfos_attn,
-                slot_info_vec_t   sinfos_idx,
-      std::vector<llama_ubatch>   ubatches) :
-    // note: the base copies the ubatches; ctx_idx gets a copy of its own
-    llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
-    mem(mem),
-    ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
-
-bool llama_memory_hybrid_idx_context::next() {
-    if (ctx_idx) {
-        ctx_idx->next();
-    }
-
-    ++i_cur;
-
-    return llama_memory_hybrid_context::next();
-}
-
-bool llama_memory_hybrid_idx_context::apply() {
-    bool res = llama_memory_hybrid_context::apply();
-
-    if (ctx_idx) {
-        res = res & ctx_idx->apply();
-    }
-
-    return res;
-}
-
-const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
-    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
-}
-
-uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
-    GGML_ASSERT(i_cur < ns_ubatch.size());
-
-    return ns_ubatch[i_cur];
-}
-
-void llama_memory_hybrid_idx_context::set_input_qsa(
+void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        bool causal_attn) const {
     GGML_ASSERT(ratio > 0);
-    GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
+    GGML_ASSERT(get_mem_idx() != nullptr);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
 
@@ -392,6 +317,8 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(r <= 64);
     const uint64_t slots_full = r == 64 ? ~uint64_t(0) : ((uint64_t(1) << r) - 1);
 
+    // TODO: this runs per ubatch and is O(n_kv) per stream, about 865 us at 33k context. the cost
+    //       is the per-cell scan rather than these allocations, so hoisting them buys nothing
     std::vector<int32_t>  blk_of(n_kv);
     std::vector<int32_t>  cell_grp(n_kv);
     std::vector<int32_t>  grp_head(n_blocks);
@@ -412,7 +339,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = mem->get_mem_idx()->get_cells(seq_of_stream);
+        const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -472,7 +399,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 int32_t g = -1;
 
                 for (int32_t c = grp_head[pb]; c >= 0; c = grp_next[c]) {
-                    if (one_seq || cells.seq_set((uint32_t) grp_first[c]) == cells.seq_set((uint32_t) j)) {
+                    if (one_seq || cells.seq_get_all((uint32_t) grp_first[c]) == cells.seq_get_all((uint32_t) j)) {
                         g = c;
                         break;
                     }
@@ -580,8 +507,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
 
-        // unpooled cells point at a dead block whose per-block bias is -inf
-        const int32_t dead_bid = n_bid < n_blocks ? n_bid : n_blocks - 1;
+        // unpooled cells all point at one spare block. a spare block exists only when some
+        // cell is unpooled: n_bid == n_blocks means every cell sits in a full block.
+        const bool     have_dead = n_bid < n_blocks;
+        const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
@@ -631,7 +560,7 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
 
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
-                // the caller adds the attention mask, which drops empty, foreign and future cells
+                // the caller adds the attention mask, which drops empty, foreign and, when causal, future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
                 for (int64_t b = 0; b < n_blocks; ++b) {
@@ -641,7 +570,14 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                     }
 
                     // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    cur_blk_bias[b] = (causal_attn && bid_idx[b] >= tail_start) ? 1e9f : 0.0f;
+                }
+
+                // the spare block holds the unpooled cells, which are the incomplete tail, so
+                // it gets the tail value. it must stay finite: a sequence with fewer than
+                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
+                if (have_dead) {
+                    cur_blk_bias[dead_bid] = 1e9f;
                 }
 
                 continue;
@@ -655,7 +591,10 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
                 if (!cells.is_empty(j) && cells.seq_has(j, seq_id)) {
                     const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
-                    if (idx <= q) {
+                    if (!causal_attn) {
+                        // every visible block competes on score and the unpooled cells are always selected
+                        v = blk_of[j] < 0 ? 1e9f : 0.0f;
+                    } else if (idx <= q) {
                         // finite, so it can never meet a -inf and produce a nan
                         v = idx >= tail_start ? 1e9f : (blk_of[j] < 0 ? -INFINITY : 0.0f);
                     }
@@ -665,4 +604,99 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
             }
         }
     }
+}
+
+//
+// llama_memory_hybrid_idx_context
+//
+
+// streams in each ubatch's slot info, matching get_k/get_v's `ns`
+static std::vector<uint32_t> llama_memory_hybrid_idx_ns(const llama_kv_cache::slot_info_vec_t & sinfos) {
+    std::vector<uint32_t> res;
+    res.reserve(sinfos.size());
+
+    for (const auto & sinfo : sinfos) {
+        res.push_back(sinfo.s1 - sinfo.s0 + 1);
+    }
+
+    return res;
+}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
+    llama_memory_hybrid_context(status) {}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hybrid_idx * mem) :
+    llama_memory_hybrid_context(mem),
+    mem(mem),
+    // graph reservation walks a full context, and qwen4exp builds the sparse attention only when this is set
+    // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
+    ns_ubatch(mem->get_mem_idx() == nullptr ?
+        std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx())) {}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
+        llama_memory_hybrid_idx * mem,
+                  llama_context * lctx,
+                           bool   optimize) :
+    llama_memory_hybrid_context(mem, lctx, optimize),
+    mem(mem),
+    // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+
+llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
+        llama_memory_hybrid_idx * mem,
+                slot_info_vec_t   sinfos_attn,
+                slot_info_vec_t   sinfos_idx,
+      std::vector<llama_ubatch>   ubatches) :
+    // note: the base copies the ubatches; ctx_idx gets a copy of its own
+    llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
+    mem(mem),
+    ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
+    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
+
+bool llama_memory_hybrid_idx_context::next() {
+    if (ctx_idx) {
+        ctx_idx->next();
+    }
+
+    ++i_cur;
+
+    return llama_memory_hybrid_context::next();
+}
+
+bool llama_memory_hybrid_idx_context::apply() {
+    bool res = llama_memory_hybrid_context::apply();
+
+    if (ctx_idx) {
+        res = res & ctx_idx->apply();
+    }
+
+    return res;
+}
+
+const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
+    return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
+    GGML_ASSERT(i_cur < ns_ubatch.size());
+
+    return ns_ubatch[i_cur];
+}
+
+void llama_memory_hybrid_idx_context::set_input_qsa(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio,
+        bool blk_bias,
+        bool causal_attn) const {
+    GGML_ASSERT(mem != nullptr);
+
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
 }

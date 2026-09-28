@@ -74,40 +74,31 @@ list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/mmf*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 
-if (GGML_CUDA_FA_ALL_QUANTS)
-    file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-vec*.cu")
-    list(APPEND GGML_SOURCES_ROCM ${SRCS})
-    add_compile_definitions(GGML_CUDA_FA_ALL_QUANTS)
-else()
-    list(APPEND GGML_SOURCES_ROCM
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-bf16-bf16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-q4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-q4_0-q8_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo4_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo3_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-f16.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo2_0.cu
-        ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-f16.cu)
-endif()
+ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cuda SRCS)
+list(APPEND GGML_SOURCES_ROCM ${SRCS})
+# TurboQuant KV vector instances are always compiled, outside GGML_CUDA_FA_QUANTS
+list(APPEND GGML_SOURCES_ROCM
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-q8_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo2_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-q8_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo2_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo2_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-q8_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-q8_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-turbo2_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo4_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo4_0-f16.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo3_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo3_0-f16.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-f16-turbo2_0.cu
+    ../ggml-cuda/template-instances/fattn-vec-instance-turbo2_0-f16.cu)
 
 list(APPEND GGML_SOURCES_ROCM "${CMAKE_CURRENT_SOURCE_DIR}/../ggml-turbo-quant-hip.hip")
 
