@@ -84,10 +84,15 @@ static int sharpen_attention(llama_model * model, float scale) {
     return n;
 }
 
-// attention outputs of every layer, concatenated over the ubatches of the prompt
+// attention outputs of every layer, concatenated over the ubatches of the prompt;
+// "#fa_host" / "#fa_device" count where the FlashAttention nodes ran, since the scheduler
+// quietly moves an op the GPU backend does not support to the CPU
 using attn_outputs = std::map<std::string, std::vector<float>>;
 
 static bool collect_attn(ggml_tensor * t, bool ask, void * user_data) {
+    if (ask && t->op == GGML_OP_FLASH_ATTN_EXT && t->buffer != nullptr) {
+        (*(attn_outputs *) user_data)[ggml_backend_buffer_is_host(t->buffer) ? "#fa_host" : "#fa_device"].push_back(0.0f);
+    }
     // kqv_out is the attention result; some archs rename that tensor, so also take attn_output
     const bool match = strncmp(t->name, "kqv_out", 7) == 0 || strncmp(t->name, "attn_output", 11) == 0;
     if (!match || t->type != GGML_TYPE_F32) {
@@ -157,6 +162,9 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & x)
 static double nmse(const attn_outputs & ref, const attn_outputs & x) {
     double worst = 0.0;
     for (const auto & [name, r] : ref) {
+        if (name[0] == '#') {
+            continue;
+        }
         auto it = x.find(name);
         worst = std::max(worst, it == x.end() ? std::numeric_limits<double>::infinity() : nmse(r, it->second));
     }
@@ -223,6 +231,9 @@ int main(int argc, char ** argv) {
             ok = false;
             continue;
         }
+        const auto count = [&](const char * key) { auto it = x.find(key); return it == x.end() ? size_t(0) : it->second.size(); };
+        fprintf(stderr, "%s : %-8s FlashAttention nodes: %zu on device, %zu on host\n", __func__,
+                ggml_type_name(c.type), count("#fa_device"), count("#fa_host"));
         const double err   = nmse(ref, x);
         const double ratio = noise > 0.0 ? err/noise : std::numeric_limits<double>::infinity();
         const bool   pass  = std::isfinite(err) && (c.max_ratio == 0.0 || ratio <= c.max_ratio);
