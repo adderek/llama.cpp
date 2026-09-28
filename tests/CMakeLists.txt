@@ -207,6 +207,32 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_SETUP generate-models
     )
 
+    # fork: TurboQuant KV cache vs f16, one test per attention path (test-turbo-kv.cpp).
+    # TURBO_KV_SCALE sharpens attention in the generated models; without it a missing Q
+    # rotation goes unnoticed. The dense path needs larger weights instead (-d 0.5).
+    llama_build(test-turbo-kv.cpp)
+    file(MAKE_DIRECTORY "${MODEL_DIR}/turbo-kv")
+
+    llama_test(
+        test-llama-archs
+        NAME test-generate-models-turbo-kv
+        LABEL main
+        ARGS -a "^llama$" -d 0.5 -o "${MODEL_DIR}/turbo-kv/"
+    )
+    set_tests_properties(test-generate-models-turbo-kv PROPERTIES
+        FIXTURES_SETUP generate-models-turbo-kv
+    )
+
+    llama_test(test-turbo-kv NAME test-turbo-kv-dense LABEL main ARGS -m "${MODEL_DIR}/turbo-kv/llama-dense.gguf")
+    set_tests_properties(test-turbo-kv-dense PROPERTIES FIXTURES_REQUIRED generate-models-turbo-kv)
+
+    llama_test(test-turbo-kv NAME test-turbo-kv-qsa  LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    llama_test(test-turbo-kv NAME test-turbo-kv-mla  LABEL main ARGS -m "${MODEL_DIR}/deepseek2-moe.gguf")
+    llama_test(test-turbo-kv NAME test-turbo-kv-dsa  LABEL main ARGS -m "${MODEL_DIR}/deepseek32-moe.gguf")
+    set_tests_properties(test-turbo-kv-qsa PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=256")
+    set_tests_properties(test-turbo-kv-mla PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=64")
+    set_tests_properties(test-turbo-kv-dsa PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=64")
+
     llama_test(
         test-recurrent-state-rollback
         LABEL main
