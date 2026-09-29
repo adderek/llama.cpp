@@ -1504,12 +1504,67 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // fork: reuse the quantization when the previous mat-vec on this stream read the same src1
+    // tensor in this graph evaluation. On RDNA3 decode is launch-bound (~1600 kernels per token,
+    // GPU idle half the time); layers that project one input several ways re-quantize it each time.
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    const char * src1_q8_1_ptr = nullptr;
     {
-        const int64_t s11 = src1->nb[1] / ts_src1;
-        const int64_t s12 = src1->nb[2] / ts_src1;
-        const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        static const bool cache_enabled = [] {
+            const char * off = getenv("GGML_CUDA_MMVQ_SRC1_CACHE");
+            const char * opt = getenv("GGML_CUDA_GRAPH_OPT"); // concurrent streams: one shared buffer would race
+            return !(off && atoi(off) == 0) && !(opt && atoi(opt) == 1);
+        }();
+        auto & c = ctx.mmvq_src1_cache;
+
+        bool same = cache_enabled && c.gen == ctx.graph_gen && c.tensor == src1 && c.data == src1->data &&
+            c.stream == stream && c.size >= q8_1_size;
+        for (int i = 0; same && i < 4; ++i) {
+            same = c.ne[i] == src1->ne[i] && c.nb[i] == src1->nb[i];
+        }
+
+        if (same) {
+            src1_q8_1_ptr = (const char *) c.buf;
+        } else {
+            char * dst_q8_1 = nullptr;
+            if (cache_enabled) {
+                if (c.buf == nullptr) {
+                    // Allocated once and never moved: captured CUDA graphs keep this address. Not
+                    // inside a capture; a src1 larger than the buffer simply uses the pool.
+                    cudaStreamCaptureStatus capture_status;
+                    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+                    if (capture_status == cudaStreamCaptureStatusNone) {
+                        const size_t size = std::max(q8_1_size, (size_t) 4 << 20);
+                        CUDA_CHECK(cudaMalloc(&c.buf, size));
+                        c.size = size;
+                    }
+                }
+                if (c.size >= q8_1_size) {
+                    dst_q8_1 = (char *) c.buf;
+                }
+            }
+            if (dst_q8_1 != nullptr) {
+                c.tensor = src1;
+                c.data   = src1->data;
+                c.stream = stream;
+                c.gen    = ctx.graph_gen;
+                for (int i = 0; i < 4; ++i) {
+                    c.ne[i] = src1->ne[i];
+                    c.nb[i] = src1->nb[i];
+                }
+            } else {
+                c.tensor = nullptr; // whatever the buffer holds no longer matches its key
+                dst_q8_1 = src1_q8_1.alloc(q8_1_size);
+            }
+
+            const int64_t s11 = src1->nb[1] / ts_src1;
+            const int64_t s12 = src1->nb[2] / ts_src1;
+            const int64_t s13 = src1->nb[3] / ts_src1;
+            quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_ptr = dst_q8_1;
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1535,7 +1590,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
