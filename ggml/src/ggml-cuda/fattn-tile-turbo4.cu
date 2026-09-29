@@ -64,7 +64,7 @@ bool ggml_cuda_flash_attn_ext_tile_turbo4_supported(const ggml_tensor * dst) {
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     return K->type == GGML_TYPE_TURBO4_0 && V->type == GGML_TYPE_TURBO4_0 &&
-        (K->ne[0] == 128 || K->ne[0] == 256) && V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] &&
+        (K->ne[0] == 128 || K->ne[0] == 256) /* 512 measured slower than VEC for decode (gemma4) */ && V->ne[0] == K->ne[0] && Q->ne[0] == K->ne[0] &&
         logit_softcap == 0.0f && dst->src[4] == nullptr; // no sinks: kept out until tested
 #else
     GGML_UNUSED(dst);

@@ -45,7 +45,10 @@ static std::vector<float> run(ggml_backend_t backend, const fa_case & c,
     ggml_backend_tensor_set(m, m_data.data(), 0, ggml_nbytes(m));
 
     std::vector<float> res;
-    if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS) {
+    if (!ggml_backend_supports_op(backend, out)) {
+        // e.g. head 512 without GQA: in a real graph the scheduler would run it elsewhere
+        res.assign(1, NAN);
+    } else if (ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS) {
         res.resize(ggml_nelements(out));
         ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
     }
@@ -76,9 +79,9 @@ int main() {
     std::normal_distribution<float> nd(0.0f, 1.0f);
 
     std::vector<fa_case> cases;
-    for (int64_t D : {128, 256}) {
+    for (int64_t D : {128, 256, 512}) {
         for (int64_t gqa : {1, 2, 4, 8}) {
-            for (int64_t n_q : {1, 2, 3, 8}) {
+            for (int64_t n_q : {1, 2, 3, 8, 32}) {
                 for (int64_t n_kv : {256, 1024}) {
                     cases.push_back({D, n_q, 2, gqa, n_kv});
                 }
@@ -87,6 +90,7 @@ int main() {
     }
 
     int n_fail = 0;
+    int n_skip = 0;
     for (const fa_case & c : cases) {
         const int64_t n_head = c.n_head_kv*c.gqa;
 
@@ -112,6 +116,14 @@ int main() {
 
         const std::vector<float> ref = run(be_cpu, c, q_data, k_data, v_data, m_data);
         const std::vector<float> got = run(be_gpu, c, q_data, k_data, v_data, m_data);
+        if (got.size() == 1 && std::isnan(got[0])) {
+            n_skip++;
+            if (getenv("FATTN_TURBO4_VERBOSE")) {
+                fprintf(stderr, "D=%3lld gqa=%lld n_q=%lld n_kv=%5lld: not supported on this device, skipped\n",
+                    (long long) c.D, (long long) c.gqa, (long long) c.n_q, (long long) c.n_kv);
+            }
+            continue;
+        }
 
         double num = 0.0, den = 0.0;
         bool finite = got.size() == ref.size() && !ref.empty();
@@ -132,7 +144,8 @@ int main() {
         n_fail += !ok;
     }
 
-    fprintf(stderr, "%s: %d/%zu cases passed\n", ggml_backend_name(be_gpu), (int) cases.size() - n_fail, cases.size());
+    fprintf(stderr, "%s: %d/%zu cases passed, %d not supported by the device\n", ggml_backend_name(be_gpu),
+        (int) cases.size() - n_fail - n_skip, cases.size() - n_skip, n_skip);
     ggml_backend_free(be_gpu);
     ggml_backend_free(be_cpu);
     return n_fail == 0 ? 0 : 1;

@@ -766,7 +766,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             // so the non-contiguous dequant assert quoted above does not apply.
             static const int vec_max_batch = getenv("GGML_CUDA_TURBO_VEC_MAX_BATCH") ?
                 atoi(getenv("GGML_CUDA_TURBO_VEC_MAX_BATCH")) : 8;
-            const bool dequant_ok = Q->ne[1] > vec_max_batch && Q->ne[0] <= 256 && Q->ne[0] == V->ne[0];
+            const bool dequant_ok = Q->ne[1] > vec_max_batch && (Q->ne[0] <= 256 || Q->ne[0] == 512) && Q->ne[0] == V->ne[0];
             if (!dequant_ok) {
 #ifdef GGML_USE_HIP
                 // Small batches with GQA: TILE reads each turbo4 block once for all Q heads of a
