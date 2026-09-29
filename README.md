@@ -1,22 +1,38 @@
 > [!NOTE]
 > **This is [adderek/llama.cpp](https://github.com/adderek/llama.cpp), a fork of
 > [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** tuned for AMD Radeon RX 7900 XTX
-> (gfx1100, RDNA3) on ROCm, and tested only there. What it adds:
+> (gfx1100, RDNA3) on ROCm 7.2.4 / Linux, and **tested only there**. Upstream is merged in
+> regularly. The most important changes:
 >
+> **KV cache compression**
 > - **TurboQuant KV cache** (`--cache-type-k/-v turbo2|turbo3|turbo4`): 2.1-4.25 bits per value,
->   3.8x smaller than f16 at turbo4, on dense, GQA, sparse (QSA), MLA and DSA attention.
-> - **FlashAttention kernels for it on RDNA3**: 2.6-5.4x faster prefill at 16-64k context, and
->   decode up to 34% faster (on Ornith-35B that beats an f16 cache at long context).
-> - **MoE models larger than VRAM**: choose which GPU runs offloaded expert matmuls; and, on
->   branch [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier) (not yet in
->   `master`), models larger than VRAM + RAM with hot experts on the GPU and cold ones
->   streamed from NVMe (O_DIRECT): 2.4 instead of 0.9 tokens/s on a 244 GB 397B model.
-> - **ROCm robustness fixes**: prompt-cache GPU fault, a turbo decode hang, a CUDA-graph abort,
->   and a server stall watchdog.
-> - **K2-Horizon** model support.
+>   3.8x smaller than f16 at turbo4. Works on dense, GQA, sparse (QSA, Qwen3.8-Flash-Next), MLA
+>   and DSA attention; K and V may use different types.
+> - **Correctness fixes on top of it**: the QSA path read the cache in the wrong basis and
+>   silently answered from the wrong part of the context; GQA models with padded heads crashed.
 >
-> Details, measurements, environment variables, the fork's tests and **which GPUs it can run on**:
-> **[FORK.md](FORK.md)**. Everything below is the upstream README, unchanged.
+> **Speed on RDNA3**
+> - **FlashAttention for turbo caches**: 2.6-5.4x faster prefill at 16-64k context; decode up to
+>   34% faster, on Ornith-35B faster than an f16 cache at long context.
+> - **MoE models larger than VRAM**: offloaded expert matmuls go to the GPU you choose
+>   (`GGML_CUDA_OP_OFFLOAD_DEVICES`), 2x prefill here.
+> - **Models larger than VRAM + RAM** on branch [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier)
+>   (not yet in `master`): hot experts on the GPU, cold ones streamed from NVMe with O_DIRECT,
+>   2.4 instead of 0.9 tokens/s on a 244 GB 397B model.
+>
+> **Server and runtime**
+> - **`--reasoning auto` does not enable thinking** (upstream does); use `--reasoning on`.
+> - Speculative decoding parameters can be set per request; logs show wall-clock time and
+>   busy/total slots; a stall watchdog dumps backtraces (`LLAMA_STALL_WATCHDOG_SECS`).
+> - ROCm robustness: fixed a GPU fault on prompt-cache restore, a turbo decode hang and an abort
+>   under CUDA-graph capture.
+> - `--hugepages` for model weights; **K2-Horizon** model support.
+>
+> **Regression tests** for every fork feature run in ctest (`test-turbo-kv-*`, `test-fattn-turbo4`, ...).
+>
+> Details, measurements, environment variables and **which GPUs it can run on** (no turbo on
+> Metal / Vulkan / SYCL; CUDA never built): **[FORK.md](FORK.md)**. Everything below is the
+> upstream README, unchanged.
 
 # llama.cpp
 
