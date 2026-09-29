@@ -85,8 +85,23 @@ cache takes 3.8x less memory.
   in RAM. Upstream takes the first device, which on this box is the card behind a PCIe Gen3 x4
   chipset link; pointing it at the x16 card doubled prefill of Qwen3.8-Flash-Next
   (305 → 600 tokens/s). `dfa85e69b`.
-- Per-expert tiering (hot experts in VRAM, cold ones in RAM or read from NVMe with O_DIRECT)
-  lives on branch `moe-tier`, not in `master`.
+- **Models larger than VRAM + RAM, streamed from NVMe** — branch
+  [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier), **not in `master`** yet
+  (it is based on `master` before the 2026-09-28 upstream merge):
+  - experts are permuted hottest-first by the routing counts in an imatrix
+    (`tools/moe-tier/moe-tier.py`), then each fused expert tensor is split at load time:
+    the hottest `LLAMA_MOE_HOT` experts per layer stay on the GPU, the rest go to RAM;
+  - with `LLAMA_MOE_DIRECT=1` the cold experts are read from the file with O_DIRECT, by
+    several threads, into an arena the process owns and locks in RAM, instead of faulting
+    them in through the mmap and the page cache;
+  - the page cache is kept small when the model does not fit (no whole-file prefetch at
+    load, experts copied to VRAM are dropped from it).
+
+  Measured on a 397B MoE at Q4_K_M (244 GB against ~159 GB of VRAM + RAM): decode
+  0.9 tokens/s through mmap, **2.4 tokens/s with the O_DIRECT arena**; the same model at
+  Q2_K, which fits, runs at 5.4. On a model that fits in VRAM + RAM, per-expert placement
+  gave +30% decode over `--n-cpu-moe` at 25% of the experts in VRAM (Ornith-35B).
+  Environment variables and usage: `tools/moe-tier/README.md` on that branch.
 
 ### 4. Models
 

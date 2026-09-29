@@ -7,7 +7,10 @@
 >   3.8x smaller than f16 at turbo4, on dense, GQA, sparse (QSA), MLA and DSA attention.
 > - **FlashAttention kernels for it on RDNA3**: 2.6-5.4x faster prefill at 16-64k context, and
 >   decode up to 34% faster (on Ornith-35B that beats an f16 cache at long context).
-> - **MoE models larger than VRAM**: choose which GPU runs offloaded expert matmuls.
+> - **MoE models larger than VRAM**: choose which GPU runs offloaded expert matmuls; and, on
+>   branch [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier) (not yet in
+>   `master`), models larger than VRAM + RAM with hot experts on the GPU and cold ones
+>   streamed from NVMe (O_DIRECT): 2.4 instead of 0.9 tokens/s on a 244 GB 397B model.
 > - **ROCm robustness fixes**: prompt-cache GPU fault, a turbo decode hang, a CUDA-graph abort,
 >   and a server stall watchdog.
 > - **K2-Horizon** model support.
