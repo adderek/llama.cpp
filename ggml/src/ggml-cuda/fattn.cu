@@ -1,4 +1,6 @@
 #include "common.cuh"
+#include <climits>
+#include <cstdlib>
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
 #include "fattn-tile.cuh"
@@ -748,20 +750,29 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // Turbo KV types (turbo2/3/4) use a custom packed format that TILE and MMA kernels cannot
-    // decode — those kernels reinterpret K/V bytes as raw f16, producing garbage output.
-    // MMA_F16's pre-dequant path also fails: build_attn_mha permutes then transposes V, leaving
-    // V->nb[0] = n_kv_heads * type_size ≠ type_size, which violates the non-contiguous dequant
-    // ASSERT in launch_fattn.  VEC has correct on-the-fly turbo dequantization; use it always.
+    // decode on the fly. VEC dequantizes turbo on the fly and serves small batches; larger ones
+    // go through launch_fattn's f16 pre-dequant instead. That pre-dequant was once ruled out
+    // because a transposed V (v_trans) breaks the non-contiguous dequant assert, but V is never
+    // transposed when FlashAttention is on.
     {
         auto is_turbo = [](ggml_type t) {
             return t == GGML_TYPE_TURBO2_0 || t == GGML_TYPE_TURBO3_0 || t == GGML_TYPE_TURBO4_0;
         };
         if (is_turbo(K->type) || is_turbo(V->type)) {
-            // VEC supports D in {64,128,256} via can_use_vector_kernel, and D=512 explicitly.
-            if (can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
-                return BEST_FATTN_KERNEL_VEC;
+            // Large batches (prefill) dequantize K/V to f16 once and take the regular kernels below:
+            // VEC is built for a handful of query rows, and at 4096 rows over a 32k cache it cost
+            // 5-6x the attention time of an f16 cache. V is not transposed under FlashAttention,
+            // so the non-contiguous dequant assert quoted above does not apply.
+            static const int vec_max_batch = getenv("GGML_CUDA_TURBO_VEC_MAX_BATCH") ?
+                atoi(getenv("GGML_CUDA_TURBO_VEC_MAX_BATCH")) : 8;
+            const bool dequant_ok = Q->ne[1] > vec_max_batch && Q->ne[0] <= 256 && Q->ne[0] == V->ne[0];
+            if (!dequant_ok) {
+                // VEC supports D in {64,128,256} via can_use_vector_kernel, and D=512 explicitly.
+                if (can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
+                    return BEST_FATTN_KERNEL_VEC;
+                }
+                return BEST_FATTN_KERNEL_NONE;
             }
-            return BEST_FATTN_KERNEL_NONE;
         }
     }
 

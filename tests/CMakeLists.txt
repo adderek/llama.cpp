@@ -230,6 +230,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_test(test-turbo-kv NAME test-turbo-kv-mla  LABEL main ARGS -m "${MODEL_DIR}/deepseek2-moe.gguf")
     llama_test(test-turbo-kv NAME test-turbo-kv-dsa  LABEL main ARGS -m "${MODEL_DIR}/deepseek32-moe.gguf")
     set_tests_properties(test-turbo-kv-qsa PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=256")
+    # prefill uses the f16-dequant FlashAttention path above 8 query rows; keep the VEC path covered too
+    llama_test(test-turbo-kv NAME test-turbo-kv-qsa-vec LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
+    set_tests_properties(test-turbo-kv-qsa-vec PROPERTIES FIXTURES_REQUIRED generate-models
+        ENVIRONMENT "TURBO_KV_SCALE=256;GGML_CUDA_TURBO_VEC_MAX_BATCH=1000000")
     set_tests_properties(test-turbo-kv-mla PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=64")
     set_tests_properties(test-turbo-kv-dsa PROPERTIES FIXTURES_REQUIRED generate-models ENVIRONMENT "TURBO_KV_SCALE=64")
 
