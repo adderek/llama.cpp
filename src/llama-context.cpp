@@ -3839,13 +3839,13 @@ llama_context * llama_init_from_model(
         }
     }
 
-    // The padded head sizes are correct but have no CUDA/HIP FlashAttention kernel for turbo
-    // (only VEC, D <= 256 or 512), so the scheduler moves that op to the CPU without a word.
-    if (is_turbo_type(params.type_k) && model->hparams.n_embd_head_k() % 128 != 0 &&
+    // Heads padded past 256 (other than 512), e.g. MLA 576 -> 640, are correct but have no CUDA/HIP
+    // FlashAttention kernel for turbo, so the scheduler moves that op to the CPU without a word.
+    const uint32_t turbo_padded_head_k = (model->hparams.n_embd_head_k() + 127)/128*128;
+    if (is_turbo_type(params.type_k) && turbo_padded_head_k > 256 && turbo_padded_head_k != 512 &&
             ggml_backend_dev_type(model->dev_layer(0)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
         LLAMA_LOG_WARN("%s: K cache type %s pads n_embd_head_k=%u to %u; on CUDA/HIP its FlashAttention runs on the CPU (slow)\n",
-            __func__, ggml_type_name(params.type_k), model->hparams.n_embd_head_k(),
-            (model->hparams.n_embd_head_k() + 127)/128*128);
+            __func__, ggml_type_name(params.type_k), model->hparams.n_embd_head_k(), turbo_padded_head_k);
     }
 
     // TurboQuant zero-pads each head to a multiple of its 128 block in the KV cache (llama_kv_cache)
