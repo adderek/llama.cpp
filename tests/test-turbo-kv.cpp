@@ -102,7 +102,21 @@ static bool collect_attn(ggml_tensor * t, bool ask, void * user_data) {
         auto & v = (*(attn_outputs *) user_data)[t->name];
         const size_t n = v.size();
         v.resize(n + ggml_nelements(t));
-        ggml_backend_tensor_get(t, v.data() + n, 0, ggml_nbytes(t));
+        if (ggml_is_contiguous(t)) {
+            ggml_backend_tensor_get(t, v.data() + n, 0, ggml_nbytes(t));
+        } else {
+            // a view (e.g. a padded turbo V head trimmed back): ggml_nbytes spans the strides, so
+            // fetch the bytes it covers and gather the elements
+            std::vector<uint8_t> raw(ggml_nbytes(t));
+            ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+            size_t k = n;
+            for (int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+            for (int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+            for (int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+            for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                memcpy(&v[k++], raw.data() + i0*t->nb[0] + i1*t->nb[1] + i2*t->nb[2] + i3*t->nb[3], sizeof(float));
+            }
+        }
     }
     return true;
 }
@@ -134,8 +148,18 @@ static attn_outputs run(llama_model * model, const common_params & params, ggml_
     for (uint32_t pos = 0; pos < n_prompt; ++pos) {
         common_batch_add(batch, (llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, { 0 }, pos + 1 == n_prompt);
     }
-    const bool ok = llama_decode(ctx, batch) == 0;
+    bool ok = llama_decode(ctx, batch) == 0;
     llama_batch_free(batch);
+
+    // then decode one token at a time: attention with a single query row takes the small-batch
+    // kernels (VEC, or TILE reading turbo4 directly), which the prompt above never reaches
+    constexpr uint32_t n_decode = 8;
+    for (uint32_t pos = n_prompt; ok && pos < n_prompt + n_decode; ++pos) {
+        llama_batch one = llama_batch_init(1, 0, 1);
+        common_batch_add(one, (llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, { 0 }, true);
+        ok = llama_decode(ctx, one) == 0;
+        llama_batch_free(one);
+    }
     llama_free(ctx);
 
     return ok ? out : attn_outputs{};
@@ -158,15 +182,35 @@ static double nmse(const std::vector<float> & ref, const std::vector<float> & x)
     return den == 0.0 ? 0.0 : num/den;
 }
 
+// A turbo cache pads each head to a multiple of 128, and kqv_out is taken before the padding is
+// trimmed off again: keep the first head_dim values of every padded head.
+static std::vector<float> unpad_heads(const std::vector<float> & x, size_t n_ref, int64_t n_head, int64_t head_dim) {
+    if (x.size() == n_ref || n_head <= 0 || head_dim <= 0 || n_ref % (n_head*head_dim) != 0) {
+        return x;
+    }
+    const size_t rows = n_ref / (n_head*head_dim);
+    if (x.size() % (rows*n_head) != 0) {
+        return x;
+    }
+    const size_t padded = x.size() / (rows*n_head);
+    std::vector<float> out;
+    out.reserve(n_ref);
+    for (size_t r = 0; r < rows*n_head; ++r) {
+        out.insert(out.end(), x.begin() + r*padded, x.begin() + r*padded + head_dim);
+    }
+    return out;
+}
+
 // worst layer
-static double nmse(const attn_outputs & ref, const attn_outputs & x) {
+static double nmse(const attn_outputs & ref, const attn_outputs & x, int64_t n_head, int64_t head_dim) {
     double worst = 0.0;
     for (const auto & [name, r] : ref) {
         if (name[0] == '#') {
             continue;
         }
         auto it = x.find(name);
-        worst = std::max(worst, it == x.end() ? std::numeric_limits<double>::infinity() : nmse(r, it->second));
+        worst = std::max(worst, it == x.end() ? std::numeric_limits<double>::infinity() :
+            nmse(r, unpad_heads(it->second, r.size(), n_head, head_dim)));
     }
     return worst;
 }
@@ -202,6 +246,9 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : scaled Q in %d tensors by %g\n", __func__, sharpen_attention(model, scale), scale);
     }
 
+    const int64_t n_head   = llama_model_n_head(model);
+    const int64_t head_dim = model->hparams.n_embd_head_v();
+
     const attn_outputs ref = run(model, params, GGML_TYPE_F16);
     if (ref.empty()) {
         fprintf(stderr, "%s : f16 reference decode failed\n", __func__);
@@ -213,7 +260,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "%s : q4_0 decode failed\n", __func__);
         return 1;
     }
-    const double noise = nmse(ref, yardstick);
+    const double noise = nmse(ref, yardstick, n_head, head_dim);
     fprintf(stderr, "%s : q4_0     nmse vs f16 = %.3e (yardstick)\n", __func__, noise);
 
     // allowed error as a multiple of the q4_0 error; 0 = only require a finite result
@@ -234,7 +281,7 @@ int main(int argc, char ** argv) {
         const auto count = [&](const char * key) { auto it = x.find(key); return it == x.end() ? size_t(0) : it->second.size(); };
         fprintf(stderr, "%s : %-8s FlashAttention nodes: %zu on device, %zu on host\n", __func__,
                 ggml_type_name(c.type), count("#fa_device"), count("#fa_host"));
-        const double err   = nmse(ref, x);
+        const double err   = nmse(ref, x, n_head, head_dim);
         const double ratio = noise > 0.0 ? err/noise : std::numeric_limits<double>::infinity();
         const bool   pass  = std::isfinite(err) && (c.max_ratio == 0.0 || ratio <= c.max_ratio);
         fprintf(stderr, "%s : %-8s nmse vs f16 = %.3e (%.1fx q4_0, limit %s) %s\n", __func__,

@@ -497,9 +497,76 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
     ggml_cuda_unroll<5>{}(load);
 }
 
+// fork: turbo4 (4-bit PolarQuant) K/V dequantized straight into the tile. Each block of 128
+// values is norm * centroid[4-bit index], so one pass per tile serves every Q head that shares
+// this KV head (GQA) - the VEC kernel instead dequantizes the same block once per Q head.
+// KV is the first row (turbo4 bytes), stride_KV the row stride in 4-byte units (as for half2),
+// col0 the first element of the row fragment and J its length.
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo4(
+        const half2 * const __restrict__ KV, half2 * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int col0, const float * const __restrict__ lut) {
+    static_assert(TURBO4_USE_4BIT, "the turbo4 tile loader handles the 4-bit format only");
+    static_assert(J % 8 == 0 && (J/2 + J_padding) % 4 == 0, "bad J");
+    // 8 values per thread: one 32-bit load of indices (qs sits 4 bytes into a 68-byte block, and
+    // col0 is a multiple of 8, so it is aligned), one norm, one 16-byte store into the tile
+    constexpr int ngroups = J/8;
+#pragma unroll 4
+    for (int idx = threadIdx.y*warp_size + threadIdx.x; idx < I*ngroups; idx += nwarps*warp_size) {
+        const int i = idx / ngroups;
+        const int g = idx % ngroups;
+        __align__(16) half2 val[4] = {{0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}, {0.0f, 0.0f}};
+        if (!oob_check || i < i_sup) {
+            const block_turbo4_0 * row = (const block_turbo4_0 *) (KV + int64_t(i)*stride_KV);
+            const int e = col0 + 8*g;
+            const block_turbo4_0 * b = row + e / QK_TURBO4;
+            const float    norm = __half2float(b->norm);
+            const uint32_t q4   = *(const uint32_t *) (b->qs + (e % QK_TURBO4) / 2);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t q = (q4 >> (8*k)) & 0xFF;
+                val[k] = make_half2(lut[q & 0xF]*norm, lut[q >> 4]*norm);
+            }
+        }
+        ggml_cuda_memcpy_1<sizeof(val)>(tile_KV + i*(J/2 + J_padding) + 4*g, val);
+    }
+}
+
+template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
+static __device__ __forceinline__ void flash_attn_tile_load_tile_turbo4(
+        const half2 * const __restrict__ KV, float * const __restrict__ tile_KV, const int stride_KV, const int i_sup,
+        const int col0, const float * const __restrict__ lut) {
+    static_assert(TURBO4_USE_4BIT, "the turbo4 tile loader handles the 4-bit format only");
+    static_assert(J % 8 == 0, "bad J");
+    constexpr int ngroups = J/8;
+#pragma unroll 4
+    for (int idx = threadIdx.y*warp_size + threadIdx.x; idx < I*ngroups; idx += nwarps*warp_size) {
+        const int i = idx / ngroups;
+        const int g = idx % ngroups;
+        float val[8] = {0.0f};
+        if (!oob_check || i < i_sup) {
+            const block_turbo4_0 * row = (const block_turbo4_0 *) (KV + int64_t(i)*stride_KV);
+            const int e = col0 + 8*g;
+            const block_turbo4_0 * b = row + e / QK_TURBO4;
+            const float    norm = __half2float(b->norm);
+            const uint32_t q4   = *(const uint32_t *) (b->qs + (e % QK_TURBO4) / 2);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const uint32_t q = (q4 >> (8*k)) & 0xFF;
+                val[2*k + 0] = lut[q & 0xF]*norm;
+                val[2*k + 1] = lut[q >> 4]*norm;
+            }
+        }
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            tile_KV[i*(J + J_padding) + 8*g + k] = val[k];
+        }
+    }
+}
+
 // Function that performs a single iteration in for the KQ matrix multiplication:
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot>
+    bool use_logit_softcap, bool oob_check, bool turbo4, typename T_vec_dot>
 static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         T_vec_dot   * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -508,7 +575,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         const int k_VKQ_0,
         const int k_VKQ_sup,
         const int k_KQ_0,
-        float * KQ_acc) {
+        float * KQ_acc,
+        const float * lut) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -516,8 +584,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
     constexpr int cpw   = ncols > nwarps ? ncols/nwarps : 1; // Q columns per warp
     constexpr int np    = nwarps > ncols ? nwarps/ncols : 1; // number of parallel warps per Q column
 
-    flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
-        (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    if constexpr (turbo4) {
+        flash_attn_tile_load_tile_turbo4<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2, KV_tmp, stride_K2, k_VKQ_sup, k_KQ_0, lut);
+    } else {
+        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_fa, nbatch_K, cpy_ne, oob_check>
+            (K_h2 + int64_t(k_VKQ_0)*stride_K2 + k_KQ_0/2, KV_tmp, stride_K2, k_VKQ_sup);
+    }
     __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -574,7 +647,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
 
 // Function that performs a single iteration of the main loop over up to nbatch_fa tokens.
 template <int warp_size, int nwarps, int ncols1, int ncols2, int DKQ, int DV, int nbatch_fa, int nbatch_K,
-    bool use_logit_softcap, bool oob_check, typename T_vec_dot, typename T_KQ, typename T_acc>
+    bool use_logit_softcap, bool oob_check, bool turbo4, typename T_vec_dot, typename T_KQ, typename T_acc>
 static __device__ __forceinline__ void flash_attn_tile_iter(
         T_vec_dot * const Q_tmp,
         const half2 * const __restrict__ K_h2,
@@ -593,7 +666,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         T_acc * const VKQ,
         const int k_VKQ_0,
         const int k_VKQ_max,
-        const int col_Q_0) {
+        const int col_Q_0,
+        const float * lut) {
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -625,13 +699,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     constexpr int nbatch_K_last = DKQ % nbatch_K;
 #pragma unroll
     for (int k_KQ_0 = 0; k_KQ_0 < DKQ - nbatch_K_last; k_KQ_0 += nbatch_K) {
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo4>(
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, lut);
     }
     if (nbatch_K_last > 0) {
         constexpr int k_KQ_0 = DKQ - nbatch_K_last;
-        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check>(
-            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc);
+        flash_attn_tile_iter_KQ<warp_size, nwarps, ncols1, ncols2, DKQ, nbatch_fa, nbatch_K_last, use_logit_softcap, oob_check, turbo4>(
+            Q_tmp, K_h2, KV_tmp, stride_K2, k_VKQ_0, k_VKQ_sup, k_KQ_0, KQ_acc, lut);
     }
 
     // Apply logit softcap + mask, update KQ_max:
@@ -736,8 +810,13 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     static_assert(nbatch_V % np == 0, "bad nbatch_V");
 #pragma unroll
     for (int k0 = 0; k0 < nbatch_fa; k0 += nbatch_V) {
-        flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
-            (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        if constexpr (turbo4) {
+            flash_attn_tile_load_tile_turbo4<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0, 0, lut);
+        } else {
+            flash_attn_tile_load_tile<warp_size, nwarps, nbatch_V, DV, 0, oob_check>
+                (V_h2 + int64_t(k_VKQ_0 + k0)*stride_V2, KV_tmp, stride_V2, k_VKQ_sup - k0);
+        }
         __syncthreads();
 
 #ifdef FAST_FP16_AVAILABLE
@@ -806,7 +885,7 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
     }
 }
 
-template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap> // D == head size
+template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool turbo4 = false> // D == head size
 __launch_bounds__(ggml_cuda_fattn_tile_get_nthreads(DKQ, DV, ncols1*ncols2), ggml_cuda_fattn_tile_get_occupancy(DKQ, DV, ncols1*ncols2))
 static __global__ void flash_attn_tile(
         const char * Q_ptr,
@@ -920,6 +999,16 @@ static __global__ void flash_attn_tile(
 
     ggml_cuda_pdl_sync();
 
+    // turbo4 centroids in SRAM: the loader indexes them per value, which serializes on __constant__
+    const float * lut = nullptr;
+    if constexpr (turbo4) {
+        __shared__ float turbo4_lut[16];
+        if (threadIdx.y == 0 && threadIdx.x < 16) {
+            turbo4_lut[threadIdx.x] = TURBO_CENTROIDS_4BIT[threadIdx.x];
+        }
+        lut = turbo4_lut; // visible after the __syncthreads() that follows the Q load
+    }
+
     // Load Q data, convert to FP16 if fast:
 #pragma unroll
     for (int jc0 = 0; jc0 < cpw; ++jc0) {
@@ -975,24 +1064,24 @@ static __global__ void flash_attn_tile(
         int k_VKQ_0 = blockIdx.y*nbatch_fa;
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo4>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, lut);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo4>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, lut);
         }
     } else {
         // Branch without out-of-bounds checks.
         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
             constexpr bool oob_check = false;
-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, turbo4>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0, lut);
         }
     }
 
@@ -1354,6 +1443,10 @@ void ggml_cuda_flash_attn_ext_tile_case(ggml_backend_cuda_context & ctx, ggml_te
 }
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// fork: TILE reading turbo4 K/V directly (fattn-tile-turbo4.cu)
+bool ggml_cuda_flash_attn_ext_tile_turbo4_supported(const ggml_tensor * dst);
+void ggml_cuda_flash_attn_ext_tile_turbo4(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 #define DECL_FATTN_TILE_CASE(DKQ, DV)                             \
     template void ggml_cuda_flash_attn_ext_tile_case              \

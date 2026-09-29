@@ -620,6 +620,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_TILE_TURBO4 = 250, // fork: TILE reading turbo4 K/V directly
 };
 
 // K/V types for which there is a vector kernel template instance, other kernels convert these to f16:
@@ -767,6 +768,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 atoi(getenv("GGML_CUDA_TURBO_VEC_MAX_BATCH")) : 8;
             const bool dequant_ok = Q->ne[1] > vec_max_batch && Q->ne[0] <= 256 && Q->ne[0] == V->ne[0];
             if (!dequant_ok) {
+#ifdef GGML_USE_HIP
+                // Small batches with GQA: TILE reads each turbo4 block once for all Q heads of a
+                // group, where VEC dequantizes it once per Q head. GGML_CUDA_TURBO_TILE=0 opts out.
+                static const bool turbo_tile = getenv("GGML_CUDA_TURBO_TILE") ? atoi(getenv("GGML_CUDA_TURBO_TILE")) != 0 : true;
+                if (turbo_tile && gqa_opt_applies && ggml_cuda_flash_attn_ext_tile_turbo4_supported(dst)) {
+                    return BEST_FATTN_KERNEL_TILE_TURBO4;
+                }
+#endif // GGML_USE_HIP
                 // VEC supports D in {64,128,256} via can_use_vector_kernel, and D=512 explicitly.
                 if (can_use_vector_kernel || (Q->ne[0] == 512 && K->ne[1] % FATTN_KQ_STRIDE == 0)) {
                     return BEST_FATTN_KERNEL_VEC;
@@ -907,6 +916,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
+        case BEST_FATTN_KERNEL_TILE_TURBO4: // reads turbo4 directly, no f16 copies
         case BEST_FATTN_KERNEL_NONE:
             break;
     }
@@ -924,6 +934,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
+            break;
+        case BEST_FATTN_KERNEL_TILE_TURBO4:
+            ggml_cuda_flash_attn_ext_tile_turbo4(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
             ggml_cuda_flash_attn_ext_vec(ctx, dst);

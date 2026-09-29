@@ -217,7 +217,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models-turbo-kv
         LABEL main
-        ARGS -a "^llama$" -d 0.5 -o "${MODEL_DIR}/turbo-kv/"
+        ARGS -a "^(llama|qwen3)$" -d 0.5 -o "${MODEL_DIR}/turbo-kv/"
     )
     set_tests_properties(test-generate-models-turbo-kv PROPERTIES
         FIXTURES_SETUP generate-models-turbo-kv
@@ -225,6 +225,14 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_test(test-turbo-kv NAME test-turbo-kv-dense LABEL main ARGS -m "${MODEL_DIR}/turbo-kv/llama-dense.gguf")
     set_tests_properties(test-turbo-kv-dense PROPERTIES FIXTURES_REQUIRED generate-models-turbo-kv)
+
+    # qwen3: head 64 padded to 128 by turbo, and GQA (4 Q heads per KV head), so decode takes the
+    # TILE kernel that reads turbo4 directly; -vec forces the VEC kernel instead
+    llama_test(test-turbo-kv NAME test-turbo-kv-gqa     LABEL main ARGS -m "${MODEL_DIR}/turbo-kv/qwen3-dense.gguf")
+    llama_test(test-turbo-kv NAME test-turbo-kv-gqa-vec LABEL main ARGS -m "${MODEL_DIR}/turbo-kv/qwen3-dense.gguf")
+    set_tests_properties(test-turbo-kv-gqa     PROPERTIES FIXTURES_REQUIRED generate-models-turbo-kv)
+    set_tests_properties(test-turbo-kv-gqa-vec PROPERTIES FIXTURES_REQUIRED generate-models-turbo-kv
+        ENVIRONMENT "GGML_CUDA_TURBO_TILE=0")
 
     llama_test(test-turbo-kv NAME test-turbo-kv-qsa  LABEL main ARGS -m "${MODEL_DIR}/qwen4exp-moe.gguf")
     llama_test(test-turbo-kv NAME test-turbo-kv-mla  LABEL main ARGS -m "${MODEL_DIR}/deepseek2-moe.gguf")
@@ -342,6 +350,7 @@ llama_build(test-backend-ops.cpp)
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-op-offload-devices.cpp) # fork: GGML_CUDA_OP_OFFLOAD_DEVICES
 llama_build_and_test(test-top-k-graph-capture.cpp) # fork: no hipcub under graph capture
+llama_build_and_test(test-fattn-turbo4.cpp) # fork: TILE reading turbo4 K/V, GPU vs CPU
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
