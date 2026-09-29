@@ -57,6 +57,10 @@ Every attention path has to rotate Q itself. Supported and covered by tests:
 Indexer caches (QSA, DSA) always stay f16: their keys are read back with `GET_ROWS`, which
 has no turbo implementation.
 
+K and V may use different types: FlashAttention has kernels for turbo K with q8_0 or f16 V and
+the other way round, and for turbo2/3/4 mixed with each other. `llama-bench` accepts the turbo
+types in `-ctk` / `-ctv`.
+
 ### 2. FlashAttention kernels for turbo on RDNA3
 
 - **Prefill** (more than 8 query rows): turbo K/V are dequantized to f16 once per layer and the
@@ -103,13 +107,32 @@ cache takes 3.8x less memory.
   gave +30% decode over `--n-cpu-moe` at 25% of the experts in VRAM (Ornith-35B).
   Environment variables and usage: `tools/moe-tier/README.md` on that branch.
 
-### 4. Models
+### 4. Server behaviour that differs from upstream
+
+- **Reasoning is off unless asked for.** With the default `--reasoning auto`, upstream enables
+  thinking whenever the chat template supports it; here it needs `--reasoning on`
+  (`99792a7cd`). Reason: Qwen3.5/3.6 with thinking enabled put the whole answer into
+  `reasoning_content` and left `content` empty for agents. Set it explicitly when moving
+  presets between the two.
+- **Speculative decoding parameters can be set per request** (draft-model parameters, n-gram
+  sizes and the speculation type); upstream has this disabled. `901f0234f`.
+- Log lines carry **wall-clock time** (`hh:mm:ss.mmm`) instead of time since start, and slot
+  lines show **busy/total slots** (`| 3/4 |`). `6b8a014a9`.
+- Stall watchdog and the prompt-cache fault fix: see section 6 below.
+
+### 5. Models and formats
 
 - **K2-Horizon** (MoVA) architecture and converter. `f11f1c137`.
 - Qwen3.8-Flash-Next (`qwen4exp`) arrived from upstream; the fork adds turbo support on its
   QSA path.
+- **TurboQuant weight types `TQ3_1S` / `TQ4_1S`** (WHT-rotated 3- and 4-bit Lloyd-Max, 32
+  values per block), inherited from domvox: CUDA/HIP can load and run them (a fused mat-vec
+  kernel; `TQ4_1S` is converted to q8_0 at load). `llama-quantize` cannot produce them, and
+  they are untested here.
+- The multimodal loader fails the load when the vision encoder's compute buffers do not fit,
+  instead of crashing on the first image. `a04a4cf4d`.
 
-### 5. Robustness fixes (ROCm)
+### 6. Robustness fixes (ROCm)
 
 - **GPU memory fault on prompt-cache restore**: glibc returned freed heap chunks to the kernel
   and tore down pages a DMA copy was still reading. The server now keeps the heap mapped
@@ -123,7 +146,7 @@ cache takes 3.8x less memory.
 - `--hugepages`: back model weights with 2 MiB hugetlb pages (Linux, mmap path). By Jeremiah
   Blanchard, proposed upstream, not in upstream `master`.
 
-### 6. Smaller RDNA3 changes
+### 7. Smaller RDNA3 changes
 
 IQ1_M in the MMQ kernels (then disabled there for correctness), BF16 mat-vec tuning, 256-wide
 heads in the MMA FlashAttention kernel, mixed q8_0/q4_0 K/V FlashAttention. History and
