@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Repro attempt for BUG_GPU_HANG_turbo4.md: drive a long context (~29k
+# Repro attempt for docs/fork/BUG_GPU_HANG_turbo4.md: drive a long context (~29k
 # tokens) through several context-checkpoint creations with turbo4 KV cache,
 # then issue a follow-up decode and watch for a hang (zero tokens, GPU idle,
 # host blocked in hsaKmtWaitOnEvent).

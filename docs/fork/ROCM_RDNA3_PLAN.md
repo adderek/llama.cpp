@@ -1,5 +1,10 @@
 # ROCm RDNA 3 Enhancement Plan for RX 7900 XTX
 
+> **Update 2026-09-29.** Two items below were later reverted: hipCUB (section 2) was dropped
+> in `3093ada73` because rocPRIM's segmented sort aborts under CUDA-graph capture, and the
+> `>= 8` WMMA threshold was replaced by upstream's in `061b35e0f` after measuring no
+> difference. See [FORK.md](../../FORK.md) for the current state.
+
 This plan outlines the steps to implement missing ROCm features and optimizations for RDNA 3 (gfx1100) in `llama.cpp`.
 
 ## 1. Flash Attention Head Size 256 Support

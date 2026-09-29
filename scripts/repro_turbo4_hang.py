@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic repro for BUG_GPU_HANG_turbo4.md - v3, MULTI-TURN restore.
+"""Deterministic repro for docs/fork/BUG_GPU_HANG_turbo4.md - v3, MULTI-TURN restore.
 
 Root understanding (server-context.cpp:3643-3647): context checkpoints form
 ONLY at user-message boundaries (is_user_start) or near prompt end - never

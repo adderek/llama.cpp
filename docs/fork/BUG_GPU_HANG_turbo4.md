@@ -1,6 +1,7 @@
 # Bug handoff: GPU/HSA lost-wakeup hang (turbo4 KV path, RDNA3)
 
-**Status:** root-caused to the GPU/ROCm layer, not yet fixed.
+**Status:** fixed in `1a1bbb8fc` (2026-07-06), a cross-stream race in the turbo-quant HIP kernel
+launches; see "Status: fixed" near the end. The investigation below is kept as it was written.
 **Symptom:** llama-server wedges mid-generation — produces zero tokens, never
 releases the slot. Recoverable only by killing the client connection (or the
 server). Reproduced once under normal load.

@@ -1,12 +1,19 @@
-# llama.cpp + turboquant + fixes
-
-llama.cpp, + TurboQuant for AMD RX 7900 XTX
-
-Me do not undestand what domvox did, he bright me lazy
-
-- Original: https://github.com/ggml-org/llama.cpp
-- Turboquant: https://github.com/domvox/llama.cpp-turboquant-hip.git
-- adderek + claude: clone from domvox, merge ggml-org, resolve conflicts, minor fix
+> [!NOTE]
+> **This is [adderek/llama.cpp](https://github.com/adderek/llama.cpp), a fork of
+> [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** tuned for AMD Radeon RX 7900 XTX
+> (gfx1100, RDNA3) on ROCm, and tested only there. What it adds:
+>
+> - **TurboQuant KV cache** (`--cache-type-k/-v turbo2|turbo3|turbo4`): 2.1-4.25 bits per value,
+>   3.8x smaller than f16 at turbo4, on dense, GQA, sparse (QSA), MLA and DSA attention.
+> - **FlashAttention kernels for it on RDNA3**: 2.6-5.4x faster prefill at 16-64k context, and
+>   decode up to 34% faster (on Ornith-35B that beats an f16 cache at long context).
+> - **MoE models larger than VRAM**: choose which GPU runs offloaded expert matmuls.
+> - **ROCm robustness fixes**: prompt-cache GPU fault, a turbo decode hang, a CUDA-graph abort,
+>   and a server stall watchdog.
+> - **K2-Horizon** model support.
+>
+> Details, measurements, environment variables, the fork's tests and **which GPUs it can run on**:
+> **[FORK.md](FORK.md)**. Everything below is the upstream README, unchanged.
 
 # llama.cpp
 

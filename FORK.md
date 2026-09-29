@@ -1,0 +1,182 @@
+# adderek/llama.cpp — a TurboQuant fork for AMD RDNA3
+
+This is [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with a compressed KV cache
+(TurboQuant) and a set of ROCm fixes and kernels for one machine: two **Radeon RX 7900 XTX**
+cards (gfx1100, RDNA3) on Linux with ROCm 7.2.4. It is used daily to serve local models, and
+everything below was measured there.
+
+> **Hardware scope.** Built and tested **only on RX 7900 XTX (gfx1100), ROCm 7.2.4, Linux**.
+> See [What runs where](#what-runs-where) before using it on anything else.
+
+## Lineage
+
+```
+ggml-org/llama.cpp ──> domvox/llama.cpp-turboquant-hip ──> adderek/llama.cpp (this)
+      (upstream)          (TurboQuant for HIP, gfx1100)        master
+```
+
+- [domvox](https://github.com/domvox/llama.cpp-turboquant-hip) ported TurboQuant KV
+  compression to HIP. That fork has since stopped following upstream.
+- This fork took it over, merges **upstream directly** every few weeks (last: 2026-09-28,
+  `4364bf723`), and has grown well beyond it: ~100 commits of its own.
+- Branch `master` is the one in use. `domvox-main` only tracks domvox for comparison.
+
+## What is different from upstream
+
+### 1. TurboQuant KV cache (`--cache-type-k/-v turbo2|turbo3|turbo4`)
+
+K and V are rotated with a Walsh–Hadamard transform and stored as PolarQuant indices plus a
+norm per 128-value block. Queries are rotated into the same basis and the attention output is
+rotated back, so the model sees ordinary attention.
+
+| type     | bits/value | vs f16 | |
+|----------|-----------:|-------:|---|
+| `turbo4` |      4.25  |  3.8x  | the default on this box |
+| `turbo3` |      3.125 |  5.1x  | |
+| `turbo2` |      2.125 |  7.5x  | |
+| `q8_0` (upstream, for scale) | 8.5 | 1.9x | |
+
+Quality has been checked with needle-in-context recall and the fork's regression tests, not
+with a perplexity or benchmark study; pick the type per model.
+
+Heads that are not a multiple of 128 are zero-padded in the cache (for example MLA's 576
+becomes 640). `TURBO_LAYER_ADAPTIVE` can give chosen layers a wider type, see
+[environment variables](#environment-variables).
+
+Every attention path has to rotate Q itself. Supported and covered by tests:
+
+| attention path | example models | status |
+|----------------|----------------|--------|
+| dense / GQA | Llama, Qwen3, the attention layers of Qwen3.5/3.6 hybrids | yes |
+| sliding-window (iSWA) | Gemma 3/4 | has the rotation, not covered by the fork tests |
+| QSA (sparse top-k) | Qwen3.8-Flash-Next (`qwen4exp`) | yes — fixed a silent wrong-basis bug, see [docs/fork](docs/fork/BUG_TURBOQUANT_QSA_Q_ROTATION.md) |
+| MLA | DeepSeek-V2 family | yes, but on CUDA/HIP its FlashAttention runs on the **CPU** (no GPU kernel for head 640) |
+| DSA (MLA + indexer) | DeepSeek-V3.2, GLM-5 (`glm-dsa`) | yes, same CPU caveat as MLA |
+| DeepSeek-V4 (`deepseek4`) | DeepSeek-V4-Flash | **no** — the graph has no turbo handling and asserts |
+
+Indexer caches (QSA, DSA) always stay f16: their keys are read back with `GET_ROWS`, which
+has no turbo implementation.
+
+### 2. FlashAttention kernels for turbo on RDNA3
+
+- **Prefill** (more than 8 query rows): turbo K/V are dequantized to f16 once per layer and the
+  regular WMMA/tile kernels run on them, instead of the VEC kernel, which is built for a few
+  query rows. `93fa67132`.
+- **Decode** (up to 8 query rows, GQA): a TILE kernel reads turbo4 blocks straight into
+  shared memory, so one pass serves every Q head of a GQA group; VEC dequantized the same
+  block once per Q head. `b546d6118`, HIP only.
+
+Measured on one 7900 XTX, turbo4, `llama-bench`, tokens/s:
+
+| model | context | prefill before → after | decode before → after | decode, f16 cache |
+|-------|--------:|-----------------------:|----------------------:|------------------:|
+| Ornith-1.0-35B-A3B Q4_K_M | 16k | 875 → 2554 | | |
+| | 32k | | 85.4 → 104.5 | 94.8 |
+| | 64k | 277 → 1497 | 71.0 → 95.4 | 86.0 |
+| Qwen3.6-27B IQ4_NL | 16k | 328 → 838 | | |
+| | 64k | 112 → 595 | 25.9 → 27.5 | |
+
+On Ornith-35B a turbo4 cache now decodes faster than an f16 one at long context, while its KV
+cache takes 3.8x less memory.
+
+### 3. MoE models larger than VRAM
+
+- `GGML_CUDA_OP_OFFLOAD_DEVICES` picks which GPU runs the large-batch matmuls of experts kept
+  in RAM. Upstream takes the first device, which on this box is the card behind a PCIe Gen3 x4
+  chipset link; pointing it at the x16 card doubled prefill of Qwen3.8-Flash-Next
+  (305 → 600 tokens/s). `dfa85e69b`.
+- Per-expert tiering (hot experts in VRAM, cold ones in RAM or read from NVMe with O_DIRECT)
+  lives on branch `moe-tier`, not in `master`.
+
+### 4. Models
+
+- **K2-Horizon** (MoVA) architecture and converter. `f11f1c137`.
+- Qwen3.8-Flash-Next (`qwen4exp`) arrived from upstream; the fork adds turbo support on its
+  QSA path.
+
+### 5. Robustness fixes (ROCm)
+
+- **GPU memory fault on prompt-cache restore**: glibc returned freed heap chunks to the kernel
+  and tore down pages a DMA copy was still reading. The server now keeps the heap mapped
+  (`LLAMA_KEEP_HEAP_MAPPED=0` opts out). `89231e3b4`, [write-up](docs/fork/BUG_GPU_FAULT_prompt_cache.md).
+- **turbo4 decode hang**: a cross-stream race in the turbo quantization kernel launches.
+  `1a1bbb8fc`, [write-up](docs/fork/BUG_GPU_HANG_turbo4.md).
+- **Abort under CUDA-graph capture**: hipCUB's segmented sort is illegal inside a capture and
+  killed qwen4exp decode. HIP builds no longer use hipCUB, as upstream. `3093ada73`.
+- **Server stall watchdog** (`LLAMA_STALL_WATCHDOG_SECS`): dumps all thread backtraces when a
+  slot makes no progress, plus wall-clock timestamps and busy counters in the logs. `6b8a014a9`.
+- `--hugepages`: back model weights with 2 MiB hugetlb pages (Linux, mmap path). By Jeremiah
+  Blanchard, proposed upstream, not in upstream `master`.
+
+### 6. Smaller RDNA3 changes
+
+IQ1_M in the MMQ kernels (then disabled there for correctness), BF16 mat-vec tuning, 256-wide
+heads in the MMA FlashAttention kernel, mixed q8_0/q4_0 K/V FlashAttention. History and
+status: [docs/fork/ROCM_RDNA3_PLAN.md](docs/fork/ROCM_RDNA3_PLAN.md).
+
+## What runs where
+
+| | RX 7900 XTX (gfx1100) | other RDNA3 (gfx1101/1102) | RDNA4 / CDNA | NVIDIA (CUDA) | CPU | Metal / Vulkan / SYCL |
+|---|---|---|---|---|---|---|
+| everything from upstream | yes | as upstream | as upstream | as upstream | yes | as upstream |
+| turbo KV cache | **tested** | likely, untested (set `AMDGPU_TARGETS`) | untested; HIP quantize kernels assume wave32 | never built; may not compile | yes (reference, slow) | **no implementation** — falls back to CPU or fails |
+| turbo decode TILE kernel | **tested** | likely | untested | no (HIP only; VEC used) | — | — |
+| kernel thresholds | tuned here | not tuned | not tuned | — | — | — |
+
+Non-turbo fork features (op-offload device choice, `--hugepages`, server watchdog, K2-Horizon,
+the prompt-cache fix) are not tied to RDNA3.
+
+## Build
+
+Used on this box (the `_` script in the repository root wraps this, plus ccache and an archive
+of the previous binaries):
+
+```sh
+cmake -B build -G Ninja \
+  -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx1100 -DCMAKE_HIP_ARCHITECTURES=gfx1100 \
+  -DGGML_HIP_ROCWMMA_FATTN=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_HIP_FLAGS="-mllvm --amdgpu-unroll-threshold-local=600"
+cmake --build build -j
+```
+
+ROCm is held at 7.2.4 on purpose: newer RCCL cannot be patched to run on a card without PCIe
+atomics, which the chipset-attached card lacks.
+
+Typical run:
+
+```sh
+llama-server -m model.gguf -ngl 99 -fa on --cache-type-k turbo4 --cache-type-v turbo4 -c 131072
+```
+
+## Environment variables
+
+| variable | default | effect |
+|----------|---------|--------|
+| `GGML_CUDA_OP_OFFLOAD_DEVICES` | all | comma-separated device indices allowed to take offloaded large-batch ops (MoE experts in RAM). Only meaningful when devices are visible under their native numbers |
+| `GGML_CUDA_TURBO_TILE` | `1` | `0` sends turbo4 decode back to the VEC kernel |
+| `GGML_CUDA_TURBO_VEC_MAX_BATCH` | `8` | above this many query rows, turbo K/V are dequantized to f16 for FlashAttention |
+| `TURBO_LAYER_ADAPTIVE` | `0` | per-layer cache types: `1` q8_0 for the first and last 4 layers, `2` q8_0 for the last 8, `5`–`7` mixed turbo/q8_0 V (`7` = q8_0 V on the first and last 2 layers, turbo2 elsewhere) |
+| `TURBO_INNERQ` | off | calibrate a per-channel scale over this many tokens before quantizing (`TURBO_INNERQ_STRENGTH`, 0–1, default 0.5) |
+| `LLAMA_STALL_WATCHDOG_SECS` | off | server: dump backtraces after this many seconds without progress (`LLAMA_STALL_WATCHDOG_GDB=0`: log only) |
+| `LLAMA_KEEP_HEAP_MAPPED` | `1` | server: `0` lets glibc return freed heap to the kernel again (reintroduces the prompt-cache fault) |
+
+## Tests added by the fork
+
+Registered in ctest; each lives in its own file so upstream merges do not conflict.
+
+| test | guards |
+|------|--------|
+| `test-turbo-kv-{dense,gqa,qsa,mla,dsa}` | attention output with a turbo cache stays within a few times the q4_0 error of an f16 cache on every attention path; a missing Q rotation shows as 34–51x. Prefill and 8 decode steps |
+| `test-turbo-kv-{gqa,qsa}-vec` | the same with the VEC kernel forced |
+| `test-fattn-turbo4` | the turbo4 TILE kernel against the CPU backend: head 128/256, GQA 1–8, 1–8 query rows |
+| `test-op-offload-devices` | `GGML_CUDA_OP_OFFLOAD_DEVICES` restricts op offload |
+| `test-top-k-graph-capture` | top-k over long rows survives CUDA-graph capture |
+
+`test-fattn-turbo4`, `test-op-offload-devices` and `test-top-k-graph-capture` skip without a
+CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.
+
+## More
+
+- [docs/fork/](docs/fork/) — bug write-ups and the RDNA3 plan.
+- [rescued-patches/](rescued-patches/) — uncommitted work recovered from other checkouts, not applied.
+- `scripts/capture_hang.sh`, `scripts/repro_turbo4_hang.*` — GPU-hang forensics.

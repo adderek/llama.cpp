@@ -4,7 +4,7 @@
 // TurboQuant stores K (and V) WHT-rotated, so every attention path has to rotate Q into
 // the same basis and un-rotate the output. A path that forgets does not fail loudly:
 // shapes agree, nothing aborts, and the result is merely wrong (qwen4exp QSA answered
-// with a filler word instead of the planted needle, see BUG_TURBOQUANT_QSA_Q_ROTATION.md).
+// with a filler word instead of the planted needle, see docs/fork/BUG_TURBOQUANT_QSA_Q_ROTATION.md).
 //
 // The test decodes the same prompt with an f16 cache and with each turbo type, captures
 // the attention output of every layer, and compares it with the f16 one. q4_0 is the
