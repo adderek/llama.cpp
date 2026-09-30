@@ -354,6 +354,7 @@ llama_build_and_test(test-op-offload-devices.cpp) # fork: GGML_CUDA_OP_OFFLOAD_D
 llama_build_and_test(test-top-k-graph-capture.cpp) # fork: no hipcub under graph capture
 llama_build_and_test(test-fattn-turbo4.cpp) # fork: TILE reading turbo4 K/V, GPU vs CPU
 llama_build_and_test(test-mmvq-src1-cache.cpp) # fork: shared q8_1 src1 in MMVQ never stale
+llama_build_and_test(test-sigmoid-gate-fusion.cpp) # fork: fused shared expert gate, same bits as unfused
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

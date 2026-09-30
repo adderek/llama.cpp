@@ -93,6 +93,12 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// fork: sigmoid(gate) * x followed by up to GGML_CUDA_SIGMOID_GATE_MAX_ADD adds, in one kernel.
+// Returns false, having launched nothing, when the tensors do not fit the fused kernel.
+#define GGML_CUDA_SIGMOID_GATE_MAX_ADD 4
+bool ggml_cuda_op_sigmoid_gate_add(ggml_backend_cuda_context & ctx, const ggml_tensor * sigmoid_node,
+        const ggml_tensor * mul_node, const ggml_tensor * const * add_nodes, int n_add);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

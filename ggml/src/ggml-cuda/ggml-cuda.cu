@@ -4319,6 +4319,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
+    // fork: sigmoid(gate) * x + ... with one gate value per row; the shapes differ, so
+    // ggml_can_fuse only checks the MUL and ADD chain and the SIGMOID is checked here.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i, 1) &&
+            !node->view_src && !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->src[1] == node) {
+        const ggml_op ops[1 + GGML_CUDA_SIGMOID_GATE_MAX_ADD] = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
+        int n_add = GGML_CUDA_SIGMOID_GATE_MAX_ADD;
+        while (n_add > 0 && !ggml_can_fuse(cgraph, i + 1, ops, 1 + n_add)) {
+            n_add--;
+        }
+        if (ggml_can_fuse(cgraph, i + 1, ops, 1) &&
+                ggml_cuda_op_sigmoid_gate_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes + i + 2, n_add)) {
+            return 1 + n_add;
+        }
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {

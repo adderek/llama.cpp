@@ -702,6 +702,79 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused sigmoid(gate) * x + addends (fork) */
+
+// dst = x * sigmoid(gate[row]) + a[0] + a[1] + ..., the shared expert gate of qwen3next/qwen35moe
+// followed by the adds into the routed output and the residual. The operations and their order
+// are those of the unfused SIGMOID, MUL and ADD kernels, so the result is bit-identical.
+struct sigmoid_gate_add_srcs {
+    const float * a[GGML_CUDA_SIGMOID_GATE_MAX_ADD];
+};
+
+static __global__ void sigmoid_gate_add_kernel(const float * x, const float * gate, float * dst,
+        const sigmoid_gate_add_srcs srcs, const int n_add, const int64_t k, const int64_t ne0) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    // __fmul_rn keeps the product rounded on its own, as MUL wrote it, instead of contracted into an FMA
+    float v = __fmul_rn(x[i], op_sigmoid(gate[i / ne0]));
+    for (int j = 0; j < n_add; ++j) {
+        v = v + srcs.a[j][i];
+    }
+    dst[i] = v;
+}
+
+bool ggml_cuda_op_sigmoid_gate_add(ggml_backend_cuda_context & ctx, const ggml_tensor * sigmoid_node,
+        const ggml_tensor * mul_node, const ggml_tensor * const * add_nodes, int n_add) {
+    GGML_ASSERT(n_add >= 0 && n_add <= GGML_CUDA_SIGMOID_GATE_MAX_ADD);
+
+    const ggml_tensor * gate = sigmoid_node->src[0];
+    const ggml_tensor * x    = mul_node->src[0];
+    const ggml_tensor * dst  = n_add > 0 ? add_nodes[n_add - 1] : mul_node;
+
+    if (mul_node->src[1] != sigmoid_node || x == sigmoid_node) {
+        return false;
+    }
+    if (gate->type != GGML_TYPE_F32 || sigmoid_node->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
+        mul_node->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) || !ggml_is_contiguous(x) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    // one gate value per row of x
+    if (gate->ne[0] != 1 || !ggml_are_same_shape(x, mul_node)) {
+        return false;
+    }
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        if (gate->ne[d] != x->ne[d]) {
+            return false;
+        }
+    }
+
+    sigmoid_gate_add_srcs srcs = {};
+    const ggml_tensor * prev = mul_node;
+    for (int j = 0; j < n_add; ++j) {
+        const ggml_tensor * add = add_nodes[j];
+        const ggml_tensor * a   = add->src[0] == prev ? add->src[1] : add->src[0];
+        if ((add->src[0] != prev && add->src[1] != prev) || a == prev || add->type != GGML_TYPE_F32 ||
+            a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_are_same_shape(a, dst)) {
+            return false;
+        }
+        srcs.a[j] = (const float *) a->data;
+        prev = add;
+    }
+
+    const int64_t k = ggml_nelements(dst);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_gate_add_kernel, launch_params, (const float *) x->data, (const float *) gate->data,
+        (float *) dst->data, srcs, n_add, k, x->ne[0]);
+    return true;
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

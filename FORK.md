@@ -159,6 +159,9 @@ routed and shared expert gate/up), and a fused rms_norm * weight writes that q8_
 when a mat-vec will read it. On Ornith-1.0-35B-A3B that removes 230 of 351 `quantize_q8_1`
 launches per token (1622 -> 1391 kernels), +7–8% decode; the output is bit-identical.
 `GGML_CUDA_MMVQ_SRC1_CACHE=0` turns it off; it is also off under `GGML_CUDA_GRAPH_OPT=1`.
+The shared expert gate of qwen3next/qwen35moe (`sigmoid(gate) * shexp`, then the adds into the
+routed output and the residual) runs as one kernel instead of three: another 80 launches per token
+on the same model (1391 -> 1311), about +3% decode, bit-identical (`test-sigmoid-gate-fusion`).
 
 ## What runs where
 
