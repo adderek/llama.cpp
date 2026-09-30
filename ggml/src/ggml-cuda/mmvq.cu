@@ -1479,15 +1479,24 @@ void * ggml_cuda_mmvq_src1_cache_reserve(ggml_backend_cuda_context & ctx, const 
     if (ctx.mmvq_src1_cache[1].used < c->used) {
         c = &ctx.mmvq_src1_cache[1];
     }
-    if (c->buf == nullptr) {
+    if (c->buf == nullptr && !c->alloc_failed) {
         // Allocated once and never moved: captured CUDA graphs keep this address. Not inside a
         // capture; until then, or for a src1 larger than the buffer, the caller uses the pool.
         cudaStreamCaptureStatus capture_status;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
         if (capture_status == cudaStreamCaptureStatusNone) {
             const size_t alloc = std::max(size, (size_t) 4 << 20);
-            CUDA_CHECK(cudaMalloc(&c->buf, alloc));
-            c->size = alloc;
+            if (cudaMalloc(&c->buf, alloc) == cudaSuccess) {
+                c->size = alloc;
+            } else {
+                // The cache only saves a quantize. A full card must not abort decode over it:
+                // leave this slot empty for good and let the caller quantize into the pool.
+                (void) cudaGetLastError();
+                c->buf          = nullptr;
+                c->alloc_failed = true;
+                GGML_LOG_WARN("%s: no VRAM for a %zu MiB mat-vec input cache slot on device %d, running without it\n",
+                              __func__, alloc >> 20, ctx.device);
+            }
         }
     }
     if (c->size < size) {

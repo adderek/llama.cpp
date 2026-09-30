@@ -1476,6 +1476,7 @@ struct ggml_backend_cuda_context {
         void *        buf    = nullptr;
         size_t        size   = 0;
         uint64_t      used   = 0; // mmvq_src1_tick of the last hit or fill, for LRU replacement
+        bool          alloc_failed = false; // out of VRAM once: the slot stays empty, never retried
     } mmvq_src1_cache[2];
 
 #ifdef USE_CUDA_GRAPH

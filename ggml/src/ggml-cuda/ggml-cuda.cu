@@ -3605,8 +3605,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // fork: SIGMOID(beta) -> GATED_DELTA_NET, with only views in between: the GDN runs here and
     // applies the sigmoid to beta itself. Nothing between the two computes, so running it early
-    // changes nothing; its snapshot copy is still fused below.
-    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+    // changes nothing; its snapshot copy is still fused below. Not inside a concurrent-stream
+    // branch (GGML_CUDA_GRAPH_OPT): the GDN may be that branch's join node, and running it from
+    // the branch would skip the join and read the other branches before they finish.
+    if (cuda_ctx->curr_stream_no == 0 &&
+            node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
             (node->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i, 1) &&
             node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0])) {
         int j = i + 1;
