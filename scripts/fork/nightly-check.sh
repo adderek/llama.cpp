@@ -9,7 +9,7 @@
 #   2. the fork's own GPU tests again with each fusion / cache / graph switch turned off
 #   3. greedy output (temp 0, 48 tokens) of a few models: md5 against the baseline
 #   4. perplexity of one model on a fixed text: against the baseline, within PPL_TOL
-#   5. long-context canary: a ~25k token prompt with tools must end in a sensible tool call,
+#   5. long-context canary: a ~25k token prompt with tools must end in a read_file call on a doc,
 #      not `////` (the symptom of 2026-09-30, see KV-ARCH-INVESTIGATION.md)
 #
 # A changed md5 is not necessarily a bug (an intentional numeric change also moves it): it is
@@ -72,7 +72,8 @@ if [ -z "$GPU" ]; then
   exit 4
 fi
 export HIP_VISIBLE_DEVICES="${GPU#gpu}"
-uid="$(for c in /sys/class/drm/card*/device; do echo "$(cat "$c/unique_id" 2>/dev/null) $(basename "$(readlink -f "$c")")"; done | sort -k2 | sed -n "$((${GPU#gpu} + 1))p" | cut -d' ' -f1)"
+# ROCm index follows PCI bus order; unique_id names the physical card (GPU-INCIDENTS.md)
+uid="$(for f in /sys/class/drm/card*/device/unique_id; do echo "$(cat "$f") $(basename "$(readlink -f "${f%/unique_id}")")"; done | sort -k2 | sed -n "$((${GPU#gpu} + 1))p" | cut -d' ' -f1)"
 say "gpu: $GPU (unique_id $uid), uptime: $(uptime -p)"
 say ""
 
@@ -154,8 +155,8 @@ text = (m.get("reasoning_content") or "") + (m.get("content") or "")
 calls = [c["function"]["name"] + " " + c["function"]["arguments"] for c in (m.get("tool_calls") or [])]
 n = j.get("usage", {}).get("prompt_tokens")
 if "////" in text: print(f"FAIL {n} tokens: output is ////")
-elif any("build" in c for c in calls): print(f"OK {n} tokens: {calls[0][:80]}")
-else: print(f"FAIL {n} tokens: no build.md tool call: {calls} {text[:80]!r}")
+elif any(c.startswith("read_file") and ".md" in c for c in calls): print(f"OK {n} tokens: {calls[0][:80]}")
+else: print(f"FAIL {n} tokens: no read_file call on a .md path: {calls} {text[:80]!r}")
 ')"
 case "$verdict" in OK*) ok "canary ${verdict#OK }" ;; *) fail "canary ${verdict#FAIL } (if the other GPU passes this, record it in GPU-INCIDENTS.md)" ;; esac
 grep -m1 -E "Memory access fault|HW Exception" "$WORK/canary-server.log" | sed 's/^/      /' | tee -a "$REPORT" >&2
