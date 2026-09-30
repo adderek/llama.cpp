@@ -169,6 +169,13 @@ broadcast add or mul left in decode): 88.4 -> 90.0 t/s (tg256), bit-identical (`
 The GATED_DELTA_NET kernel applies the sigmoid of beta itself (1251 -> 1221, no standalone
 sigmoid left): +1.1% (tg512), bit-identical (`test-gdn-beta-sigmoid-fusion`).
 
+On RDNA3 the MMA FlashAttention kernel (upstream) summed P*V in f16 for every head size but 80
+and 112. Over a long context that sum overflows or loses precision: attention spread evenly
+over 32k positions came out 20-67% wrong, and on real Qwen3.8-27B data at 25k positions the
+output was off by NMSE 2e-3 against the CPU (VEC kernel: 1e-5). The fork keeps it in f32 (NMSE
+4e-8): perplexity at 32k context 2.4127 -> 2.4097 (Qwen3.8-27B), 2.8822 -> 2.8714 (Ministral-8B),
+for 0-1.4% of prefill speed with 256-wide heads and up to 3.7% with 128-wide heads at depth 16k.
+
 ## What runs where
 
 | | RX 7900 XTX (gfx1100) | other RDNA3 (gfx1101/1102) | RDNA4 / CDNA | NVIDIA (CUDA) | CPU | Metal / Vulkan / SYCL |
@@ -237,6 +244,7 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-sigmoid-gate-fusion` | fused `sigmoid(gate) * x + adds` gives the bits of the unfused kernels |
 | `test-add-unary-mul-fusion` | fused `op(x + bias) * g` gives the bits of the unfused kernels |
 | `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
+| `test-fattn-long-kv` | FlashAttention evenly spread over 32k KV positions returns the value, not inf or a 20-67% error: the RDNA3 MMA kernel used to sum P*V in f16 |
 
 `test-fattn-turbo4`, `test-op-offload-devices`, `test-top-k-graph-capture` and the four fusion
 and cache tests above skip without a CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.
