@@ -166,6 +166,8 @@ The residual add in front of such an rms_norm is computed in the same kernel as 
 Both together: 84.4 -> 87.9 t/s at depth 0, 81.0 -> 84.5 at 16384 (tg128, one 7900 XTX).
 `softplus(alpha + dt) * a` of the linear-attention layers is one kernel too (1281 -> 1251, no
 broadcast add or mul left in decode): 88.4 -> 90.0 t/s (tg256), bit-identical (`test-add-unary-mul-fusion`).
+The GATED_DELTA_NET kernel applies the sigmoid of beta itself (1251 -> 1221, no standalone
+sigmoid left): +1.1% (tg512), bit-identical (`test-gdn-beta-sigmoid-fusion`).
 
 ## What runs where
 

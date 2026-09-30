@@ -3603,6 +3603,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // fork: SIGMOID(beta) -> GATED_DELTA_NET, with only views in between: the GDN runs here and
+    // applies the sigmoid to beta itself. Nothing between the two computes, so running it early
+    // changes nothing; its snapshot copy is still fused below.
+    if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID &&
+            (node->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_node_has_n_uses(cgraph, i, 1) &&
+            node->type == GGML_TYPE_F32 && node->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(node->src[0])) {
+        int j = i + 1;
+        while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && cgraph->nodes[j]->view_src != node) {
+            j++;
+        }
+        ggml_tensor * gdn = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        if (gdn != nullptr && gdn->op == GGML_OP_GATED_DELTA_NET && gdn->src[4] == node &&
+                (gdn->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+            const int cpy_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, j, fused_state_cpy);
+            if (cpy_skip > 0) {
+                ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, gdn, fused_state_cpy, node->src[0]);
+            } else {
+                ggml_cuda_op_gated_delta_net(*cuda_ctx, gdn, node->src[0]);
+            }
+            return (j - i) + cpy_skip;
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
