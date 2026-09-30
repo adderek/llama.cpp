@@ -1460,9 +1460,12 @@ struct ggml_backend_cuda_context {
     int curr_stream_no = 0;
 
     // fork: the q8_1 quantization of a mat-vec src1 is reused by the next mat-vec that reads the
-    // same src1 tensor (mmvq.cu), e.g. the Q/K/V/gate projections of one layer. graph_gen changes
-    // on every graph compute, so nothing is ever reused across evaluations.
+    // same src1 tensor (mmvq.cu), e.g. the Q/K/V/gate projections of one layer. Two slots, so an
+    // input survives one mat-vec on another input in between (routed experts' down projection
+    // between their gate/up and the shared expert's). graph_gen changes on every graph compute,
+    // so nothing is ever reused across evaluations.
     uint64_t graph_gen = 0;
+    uint64_t mmvq_src1_tick = 0;
     struct mmvq_src1_cache_t {
         const void *  tensor = nullptr; // ggml_tensor identity: gallocr may reuse the data address
         const void *  data   = nullptr;
@@ -1472,7 +1475,8 @@ struct ggml_backend_cuda_context {
         uint64_t      gen    = 0;
         void *        buf    = nullptr;
         size_t        size   = 0;
-    } mmvq_src1_cache;
+        uint64_t      used   = 0; // mmvq_src1_tick of the last hit or fill, for LRU replacement
+    } mmvq_src1_cache[2];
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

@@ -1517,46 +1517,71 @@ void ggml_cuda_mul_mat_vec_q(
             const char * opt = getenv("GGML_CUDA_GRAPH_OPT"); // concurrent streams: one shared buffer would race
             return !(off && atoi(off) == 0) && !(opt && atoi(opt) == 1);
         }();
-        auto & c = ctx.mmvq_src1_cache;
-
-        bool same = cache_enabled && c.gen == ctx.graph_gen && c.tensor == src1 && c.data == src1->data &&
-            c.stream == stream && c.size >= q8_1_size;
-        for (int i = 0; same && i < 4; ++i) {
-            same = c.ne[i] == src1->ne[i] && c.nb[i] == src1->nb[i];
+        // A reshape writes nothing, so it names the same bytes as its parent: the routed experts
+        // read the FFN input reshaped, the shared expert reads it as is. Walk the direct parent
+        // (src[0]), not view_src, which would skip in-place ops that did write. Never into a leaf:
+        // caches and states are leaves that set_rows/cpy change during the graph.
+        const ggml_tensor * src1_id = src1;
+        while (src1_id->op == GGML_OP_RESHAPE && src1_id->src[0] != nullptr && src1_id->src[0]->op != GGML_OP_NONE) {
+            src1_id = src1_id->src[0];
         }
 
-        if (same) {
-            src1_q8_1_ptr = (const char *) c.buf;
+        auto matches = [&](const ggml_backend_cuda_context::mmvq_src1_cache_t & c) {
+            if (c.gen != ctx.graph_gen || c.tensor != src1_id || c.data != src1->data || c.stream != stream || c.size < q8_1_size) {
+                return false;
+            }
+            for (int i = 0; i < 4; ++i) {
+                if (c.ne[i] != src1->ne[i] || c.nb[i] != src1->nb[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        ggml_backend_cuda_context::mmvq_src1_cache_t * hit = nullptr;
+        for (auto & c : ctx.mmvq_src1_cache) {
+            if (cache_enabled && matches(c)) {
+                hit = &c;
+            }
+        }
+
+        if (hit != nullptr) {
+            hit->used = ++ctx.mmvq_src1_tick;
+            src1_q8_1_ptr = (const char *) hit->buf;
         } else {
             char * dst_q8_1 = nullptr;
+            auto * c = &ctx.mmvq_src1_cache[0];
+            if (ctx.mmvq_src1_cache[1].used < c->used) {
+                c = &ctx.mmvq_src1_cache[1];
+            }
             if (cache_enabled) {
-                if (c.buf == nullptr) {
+                if (c->buf == nullptr) {
                     // Allocated once and never moved: captured CUDA graphs keep this address. Not
                     // inside a capture; a src1 larger than the buffer simply uses the pool.
                     cudaStreamCaptureStatus capture_status;
                     CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
                     if (capture_status == cudaStreamCaptureStatusNone) {
                         const size_t size = std::max(q8_1_size, (size_t) 4 << 20);
-                        CUDA_CHECK(cudaMalloc(&c.buf, size));
-                        c.size = size;
+                        CUDA_CHECK(cudaMalloc(&c->buf, size));
+                        c->size = size;
                     }
                 }
-                if (c.size >= q8_1_size) {
-                    dst_q8_1 = (char *) c.buf;
+                if (c->size >= q8_1_size) {
+                    dst_q8_1 = (char *) c->buf;
                 }
             }
             if (dst_q8_1 != nullptr) {
-                c.tensor = src1;
-                c.data   = src1->data;
-                c.stream = stream;
-                c.gen    = ctx.graph_gen;
+                c->tensor = src1_id;
+                c->data   = src1->data;
+                c->stream = stream;
+                c->gen    = ctx.graph_gen;
+                c->used   = ++ctx.mmvq_src1_tick;
                 for (int i = 0; i < 4; ++i) {
-                    c.ne[i] = src1->ne[i];
-                    c.nb[i] = src1->nb[i];
+                    c->ne[i] = src1->ne[i];
+                    c->nb[i] = src1->nb[i];
                 }
             } else {
-                c.tensor = nullptr; // whatever the buffer holds no longer matches its key
-                dst_q8_1 = src1_q8_1.alloc(q8_1_size);
+                dst_q8_1 = src1_q8_1.alloc(q8_1_size); // the slot keeps its own, still valid, contents
             }
 
             const int64_t s11 = src1->nb[1] / ts_src1;

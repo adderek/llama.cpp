@@ -1,13 +1,16 @@
 // Fork regression test: the MMVQ src1 quantization cache must never serve a stale q8_1 copy.
 //
-// On CUDA/HIP the fork keeps the last q8_1 quantization of a mat-vec's src1 and reuses it when
-// the next mat-vec in the same graph evaluation reads the same tensor (see mmvq.cu,
+// On CUDA/HIP the fork keeps the last two q8_1 quantizations of mat-vec inputs and reuses one
+// when a later mat-vec in the same graph evaluation reads the same tensor (see mmvq.cu,
 // GGML_CUDA_MMVQ_SRC1_CACHE). This graph mixes the cases the cache key has to tell apart: one
-// input read by several weights of different types (hit), a derived input in between (miss),
-// the first input again afterwards (miss, re-quantize), MUL_MAT_ID sharing an input, and the
-// same input last in one graph and first in the next. The input changes on every compute, so a
-// copy kept across graph evaluations or baked into a captured CUDA graph shows up as a mismatch
-// against the CPU backend. Without a CUDA/HIP device the test passes.
+// input read by several weights of different types (hit), a derived input in between, the first
+// input again afterwards (hit in the second slot), three inputs cycling through the two slots
+// (evict, re-quantize), MUL_MAT_ID sharing an input, one input read both reshaped and as is
+// (hit), a reshape of an in-place result over the same bytes (miss), a leaf overwritten by the
+// graph and read again through a reshape (miss), and the same input last in one graph and first
+// in the next. The input changes on every compute, so a copy kept across graph
+// evaluations or baked into a captured CUDA graph shows up as a mismatch against the CPU
+// backend. Without a CUDA/HIP device the test passes.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -26,6 +29,7 @@ struct net {
     ggml_context * ctx;
     ggml_tensor  * x;
     ggml_tensor  * ids;
+    ggml_tensor  * st;
     std::vector<ggml_tensor *> weights;
     std::vector<ggml_tensor *> outs;
     ggml_cgraph  * gf;
@@ -39,6 +43,7 @@ static net build() {
 
     n.x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
     n.ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
+    n.st  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
     ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N);
     ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
     ggml_tensor * w3 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
@@ -52,9 +57,20 @@ static net build() {
     n.outs.push_back(ggml_mul_mat(ctx, w1, n.x));         // quantize x
     n.outs.push_back(ggml_mul_mat(ctx, w2, n.x));         // same x, other weight type: reuse
     n.outs.push_back(ggml_mul_mat(ctx, w3, x2));          // other input: quantize x2
-    n.outs.push_back(ggml_mul_mat(ctx, w2, n.x));         // x again after x2: quantize x again
+    n.outs.push_back(ggml_mul_mat(ctx, w2, n.x));         // x again after x2: second slot still has it
+    ggml_tensor * x4 = ggml_scale(ctx, n.x, 2.0f);
+    n.outs.push_back(ggml_mul_mat(ctx, w1, x4));          // third input evicts x2 (least recently used)
+    n.outs.push_back(ggml_mul_mat(ctx, w3, x2));          // x2 again: evicted, must be re-quantized
     n.outs.push_back(ggml_mul_mat_id(ctx, e1, x3, n.ids)); // MoE: gate/up style pair on one input
     n.outs.push_back(ggml_mul_mat_id(ctx, e2, x3, n.ids));
+    ggml_tensor * h  = ggml_scale(ctx, n.x, 0.75f);        // a computed input (a leaf is never unwrapped)
+    n.outs.push_back(ggml_mul_mat_id(ctx, e1, ggml_reshape_3d(ctx, h, K, 1, 1), n.ids)); // routed experts read it reshaped
+    n.outs.push_back(ggml_mul_mat(ctx, w2, h));           // shared expert reads it as is: reuse
+    ggml_tensor * hb = ggml_scale_inplace(ctx, h, -3.0f); // rewrites h's bytes
+    n.outs.push_back(ggml_mul_mat(ctx, w1, ggml_reshape_2d(ctx, hb, K, 1))); // same bytes, new values: quantize
+    n.outs.push_back(ggml_mul_mat(ctx, w2, n.st));        // a leaf, like a cache or a recurrent state...
+    n.outs.push_back(ggml_cpy(ctx, x2, n.st));            // ...that the graph overwrites...
+    n.outs.push_back(ggml_mul_mat(ctx, w3, ggml_reshape_2d(ctx, n.st, K, 1))); // ...and reads again: quantize
     n.outs.push_back(ggml_mul_mat(ctx, w1, n.x));         // last read is x, so the next compute's first
                                                            // mat-vec would hit if the key ignored the graph
 
@@ -126,6 +142,8 @@ int main() {
         const int32_t ids[2] = { it % N_EXPERT, (it + 1 + it/N_EXPERT) % N_EXPERT };
         ggml_backend_tensor_set(g.x,   x.data(), 0, ggml_nbytes(g.x));
         ggml_backend_tensor_set(c.x,   x.data(), 0, ggml_nbytes(c.x));
+        ggml_backend_tensor_set(g.st,  x.data(), 0, ggml_nbytes(g.st)); // the graph overwrote it last time
+        ggml_backend_tensor_set(c.st,  x.data(), 0, ggml_nbytes(c.st));
         ggml_backend_tensor_set(g.ids, ids,      0, sizeof(ids));
         ggml_backend_tensor_set(c.ids, ids,      0, sizeof(ids));
 

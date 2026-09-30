@@ -703,9 +703,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
-    if (mmvq_src1_cache.buf != nullptr) {
-        ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaFree(mmvq_src1_cache.buf));
+    for (auto & c : mmvq_src1_cache) {
+        if (c.buf != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(c.buf));
+        }
     }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {

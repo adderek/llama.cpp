@@ -153,9 +153,10 @@ heads in the MMA FlashAttention kernel, mixed q8_0/q4_0 K/V FlashAttention. Hist
 status: [docs/fork/ROCM_RDNA3_PLAN.md](docs/fork/ROCM_RDNA3_PLAN.md).
 
 Decode is launch-bound on this card (about 1600 kernels per token, GPU idle half the time), so
-the mat-vec path reuses the q8_1 quantization of its input when consecutive mat-vecs in one graph
-evaluation read the same tensor (Q/K/V projections, expert gate/up). On Ornith-1.0-35B-A3B that
-removes 110 of 351 `quantize_q8_1` launches per token, about +3–5% decode.
+the mat-vec path keeps the last two q8_1 quantizations of its inputs and reuses one when a later
+mat-vec in the same graph evaluation reads the same tensor, or a reshape of it (Q/K/V projections,
+routed and shared expert gate/up). On Ornith-1.0-35B-A3B that removes 150 of 351
+`quantize_q8_1` launches per token, about +4–7% decode.
 `GGML_CUDA_MMVQ_SRC1_CACHE=0` turns it off; it is also off under `GGML_CUDA_GRAPH_OPT=1`.
 
 ## What runs where
