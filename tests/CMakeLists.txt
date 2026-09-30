@@ -217,7 +217,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         test-llama-archs
         NAME test-generate-models-turbo-kv
         LABEL main
-        ARGS -a "^(llama|qwen3)$" -d 0.5 -o "${MODEL_DIR}/turbo-kv/"
+        # fixed seed: with a random one the q4_0 yardstick varies 10x between models (seed 2: 5.7e-4
+        # vs 5.8e-3) and the ratio limits failed ~1 run in 5 while GPU still matched CPU
+        ARGS -a "^(llama|qwen3)$" -d 0.5 -s 1 -o "${MODEL_DIR}/turbo-kv/"
     )
     set_tests_properties(test-generate-models-turbo-kv PROPERTIES
         FIXTURES_SETUP generate-models-turbo-kv
