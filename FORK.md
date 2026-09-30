@@ -214,6 +214,13 @@ llama-server -m model.gguf -ngl 99 -fa on --cache-type-k turbo4 --cache-type-v t
 | `TURBO_INNERQ` | off | calibrate a per-channel scale over this many tokens before quantizing (`TURBO_INNERQ_STRENGTH`, 0–1, default 0.5) |
 | `LLAMA_STALL_WATCHDOG_SECS` | off | server: dump backtraces after this many seconds without progress (`LLAMA_STALL_WATCHDOG_GDB=0`: log only) |
 | `LLAMA_KEEP_HEAP_MAPPED` | `1` | server: `0` lets glibc return freed heap to the kernel again (reintroduces the prompt-cache fault) |
+| `GGML_CUDA_MMVQ_SRC1_CACHE` | `1` | `0` turns off the reuse of q8_1 mat-vec inputs (and the fused rms_norm writing them) |
+
+`GGML_CUDA_GRAPH_OPT=1` (upstream, experimental) is not safe on this machine: on
+gemma-4-26B-A4B greedy output differs from run to run, with fusion disabled as well, and is
+stable again with `GGML_CUDA_DISABLE_GRAPHS=1` or without it, so the concurrent streams it adds
+inside CUDA graphs race on HIP. Ornith (no three-way attn_norm fork) is unaffected. Nothing here
+sets it (checked 2026-09-30).
 
 ## Tests added by the fork
 
@@ -226,9 +233,13 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-fattn-turbo4` | the turbo4 TILE kernel against the CPU backend: head 128/256, GQA 1–8, 1–8 query rows |
 | `test-op-offload-devices` | `GGML_CUDA_OP_OFFLOAD_DEVICES` restricts op offload |
 | `test-top-k-graph-capture` | top-k over long rows survives CUDA-graph capture |
+| `test-mmvq-src1-cache` | a reused q8_1 mat-vec input is never stale: across weights, slots, MUL_MAT_ID, reshapes, in-place writes, graph evaluations, and from the fused rms_norm (with and without the residual add) |
+| `test-sigmoid-gate-fusion` | fused `sigmoid(gate) * x + adds` gives the bits of the unfused kernels |
+| `test-add-unary-mul-fusion` | fused `op(x + bias) * g` gives the bits of the unfused kernels |
+| `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
 
-`test-fattn-turbo4`, `test-op-offload-devices` and `test-top-k-graph-capture` skip without a
-CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.
+`test-fattn-turbo4`, `test-op-offload-devices`, `test-top-k-graph-capture` and the four fusion
+and cache tests above skip without a CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.
 
 ## More
 
