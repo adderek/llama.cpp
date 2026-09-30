@@ -10,7 +10,9 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
 // fork: as ggml_cuda_op_rms_norm_fused, and also puts the output quantized to q8_1 into the MMVQ
 // src1 cache. Returns false, having done nothing, when it cannot.
-bool ggml_cuda_op_rms_norm_fused_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
+// With add, the ADD that produces the norm's input is computed in the same kernel (and still written out).
+bool ggml_cuda_op_rms_norm_fused_q8_1(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor,
+                                      const ggml_tensor * add = nullptr);
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 

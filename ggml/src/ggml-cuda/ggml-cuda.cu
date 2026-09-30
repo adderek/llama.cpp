@@ -3744,6 +3744,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // fork: residual ADD -> RMS_NORM -> MUL read by a mat-vec, in one kernel. The ADD keeps its
+    // other uses (the next residual), so it is written out and ggml_can_fuse does not apply to it.
+    if (node->op == GGML_OP_ADD && (node->flags & GGML_TENSOR_FLAG_COMPUTE) && i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_RMS_NORM && cgraph->nodes[i + 1]->src[0] == node &&
+            ggml_cuda_can_fuse(cgraph, i + 1, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {}) &&
+            ggml_cuda_mmvq_will_read(cgraph, i + 2, cgraph->nodes[i + 2], ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_op_rms_norm_fused_q8_1(*cuda_ctx, cgraph->nodes[i + 1], cgraph->nodes[i + 2], node)) {
+        return 2;
+    }
+
     // multi-(add or mul)
     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
         int     n_fuse = 0;

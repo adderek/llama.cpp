@@ -162,6 +162,8 @@ launches per token (1622 -> 1391 kernels), +7–8% decode; the output is bit-ide
 The shared expert gate of qwen3next/qwen35moe (`sigmoid(gate) * shexp`, then the adds into the
 routed output and the residual) runs as one kernel instead of three: another 80 launches per token
 on the same model (1391 -> 1311), about +3% decode, bit-identical (`test-sigmoid-gate-fusion`).
+The residual add in front of such an rms_norm is computed in the same kernel as well (1311 -> 1281).
+Both together: 84.4 -> 87.9 t/s at depth 0, 81.0 -> 84.5 at 16384 (tg128, one 7900 XTX).
 
 ## What runs where
 

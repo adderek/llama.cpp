@@ -8,7 +8,8 @@
 // (evict, re-quantize), MUL_MAT_ID sharing an input, one input read both reshaped and as is
 // (hit), a reshape of an in-place result over the same bytes (miss), a leaf overwritten by the
 // graph and read again through a reshape (miss), a fused rms_norm * weight that writes the q8_1
-// copy itself (one row, and three rows with a padded row length), and the same input last in
+// copy itself (one row, and three rows with a padded row length), the same with the residual add
+// before the norm fused in (its result read again by other mat-vecs), and the same input last in
 // one graph and first in the next. The input changes on every compute, so a copy kept across
 // graph evaluations or baked into a captured CUDA graph shows up as a mismatch against the CPU
 // backend. Without a CUDA/HIP device the test passes.
@@ -86,6 +87,12 @@ static net build() {
     ggml_tensor * mr = ggml_mul(ctx, ggml_rms_norm(ctx, n.xr, 1e-6f), gr); // three rows, padded q8_1 rows
     n.outs.push_back(ggml_mul_mat(ctx, wa, mr));
     n.outs.push_back(ggml_mul_mat(ctx, wb, mr));
+    ggml_tensor * r  = ggml_add(ctx, x2, x4);             // a residual add feeding the norm is computed by the
+    n.outs.push_back(ggml_mul_mat(ctx, w2, ggml_mul(ctx, ggml_rms_norm(ctx, r, 1e-6f), g))); // same kernel...
+    n.outs.push_back(ggml_mul_mat(ctx, w3, r));           // ...and must still be written out
+    ggml_tensor * rr = ggml_add(ctx, n.xr, ggml_scale(ctx, n.xr, 0.5f)); // three rows, padded
+    n.outs.push_back(ggml_mul_mat(ctx, wa, ggml_mul(ctx, ggml_rms_norm(ctx, rr, 1e-6f), gr)));
+    n.outs.push_back(ggml_mul_mat(ctx, wb, rr));
     n.outs.push_back(ggml_mul_mat(ctx, w1, n.x));         // last read is x, so the next compute's first
                                                            // mat-vec would hit if the key ignored the graph
 
