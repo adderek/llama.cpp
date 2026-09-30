@@ -775,6 +775,81 @@ bool ggml_cuda_op_sigmoid_gate_add(ggml_backend_cuda_context & ctx, const ggml_t
     return true;
 }
 
+/* fused (x + bias) -> unary -> * g (fork) */
+
+// dst = op(x + bias) * g, the decay gate of the qwen3next/qwen35 linear-attention layers
+// (softplus(alpha + dt) * a). bias and g are either the full shape or one row broadcast over all
+// rows (row_* = 0). Same operations in the same order as the ADD, UNARY and MUL kernels.
+template <float (*op)(float)>
+static __global__ void add_unary_mul_kernel(const float * x, const float * bias, const float * g, float * dst,
+        const int64_t k, const int64_t ne0, const int64_t row_bias, const int64_t row_g) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t row = i / ne0;
+    const int64_t col = i - row*ne0;
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op(x[i] + bias[row*row_bias + col]) * g[row*row_g + col];
+}
+
+bool ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * add_node,
+        const ggml_tensor * unary_node, const ggml_tensor * mul_node) {
+    if (unary_node->src[0] != add_node || (mul_node->src[0] != unary_node && mul_node->src[1] != unary_node)) {
+        return false;
+    }
+    const ggml_tensor * x = add_node->src[0];
+    const ggml_tensor * b = add_node->src[1];
+    const ggml_tensor * g = mul_node->src[0] == unary_node ? mul_node->src[1] : mul_node->src[0];
+
+    // x must be the full shape; the add is commutative, so a broadcast src0 is taken as the bias
+    if (!ggml_are_same_shape(x, add_node)) {
+        std::swap(x, b);
+    }
+    auto row_stride = [&](const ggml_tensor * t) -> int64_t {
+        if (ggml_are_same_shape(t, mul_node)) {
+            return t->ne[0];
+        }
+        return ggml_nrows(t) == 1 && t->ne[0] == mul_node->ne[0] ? 0 : -1;
+    };
+    for (const ggml_tensor * t : { x, b, g, add_node, unary_node, mul_node }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return false;
+        }
+    }
+    const int64_t row_bias = row_stride(b);
+    const int64_t row_g    = row_stride(g);
+    if (!ggml_are_same_shape(x, mul_node) || row_bias < 0 || row_g < 0) {
+        return false;
+    }
+
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t ne0 = mul_node->ne[0];
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    const float * xd = (const float *) x->data;
+    const float * bd = (const float *) b->data;
+    const float * gd = (const float *) g->data;
+    float       * dd = (float *) mul_node->data;
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SOFTPLUS:
+            ggml_cuda_kernel_launch(add_unary_mul_kernel<op_softplus>, launch_params, xd, bd, gd, dd, k, ne0, row_bias, row_g);
+            return true;
+        case GGML_UNARY_OP_SIGMOID:
+            ggml_cuda_kernel_launch(add_unary_mul_kernel<op_sigmoid>, launch_params, xd, bd, gd, dd, k, ne0, row_bias, row_g);
+            return true;
+        case GGML_UNARY_OP_SILU:
+            ggml_cuda_kernel_launch(add_unary_mul_kernel<op_silu>, launch_params, xd, bd, gd, dd, k, ne0, row_bias, row_g);
+            return true;
+        default:
+            return false;
+    }
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

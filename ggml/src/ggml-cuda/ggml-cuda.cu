@@ -3547,6 +3547,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // fork: ADD -> UNARY -> MUL, types and shapes checked by ggml_cuda_op_add_unary_mul
+    if (ops.size() == 3 && ops.begin()[0] == GGML_OP_ADD && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_MUL
+     && unary_ops.size() == 1) {
+        return ggml_get_unary_op(cgraph->nodes[node_idx+1]) == unary_ops.begin()[0];
+    }
+
     return false;
 }
 
@@ -3741,6 +3747,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // fork: ADD -> softplus/sigmoid/silu -> MUL, e.g. softplus(alpha + dt) * a
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_UNARY) {
+        const ggml_unary_op uop = ggml_get_unary_op(cgraph->nodes[i + 1]);
+        if ((uop == GGML_UNARY_OP_SOFTPLUS || uop == GGML_UNARY_OP_SIGMOID || uop == GGML_UNARY_OP_SILU) &&
+                ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL }, { uop }) &&
+                ggml_cuda_op_add_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+            return 2;
         }
     }
 

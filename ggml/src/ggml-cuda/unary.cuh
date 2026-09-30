@@ -99,6 +99,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 bool ggml_cuda_op_sigmoid_gate_add(ggml_backend_cuda_context & ctx, const ggml_tensor * sigmoid_node,
         const ggml_tensor * mul_node, const ggml_tensor * const * add_nodes, int n_add);
 
+// fork: ADD (bias) -> UNARY (softplus/sigmoid/silu) -> MUL in one kernel; false, having launched
+// nothing, when the tensors do not fit.
+bool ggml_cuda_op_add_unary_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * add_node,
+        const ggml_tensor * unary_node, const ggml_tensor * mul_node);
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
