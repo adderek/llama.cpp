@@ -1424,6 +1424,87 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// fork: q8_1 src1 cache (ggml_backend_cuda_context::mmvq_src1_cache). On RDNA3 decode is
+// launch-bound (~1600 kernels per token, GPU idle half the time) and layers that project one
+// input several ways re-quantized it each time.
+bool ggml_cuda_mmvq_src1_cache_enabled() {
+    static const bool enabled = [] {
+        const char * off = getenv("GGML_CUDA_MMVQ_SRC1_CACHE");
+        const char * opt = getenv("GGML_CUDA_GRAPH_OPT"); // concurrent streams: one shared buffer would race
+        return !(off && atoi(off) == 0) && !(opt && atoi(opt) == 1);
+    }();
+    return enabled;
+}
+
+size_t ggml_cuda_mmvq_q8_1_size(const ggml_tensor * src1) {
+    return src1->ne[3]*src1->ne[2]*src1->ne[1]*GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+}
+
+// A reshape writes nothing, so it names the same bytes as its parent: the routed experts read the
+// FFN input reshaped, the shared expert reads it as is. Walk the direct parent (src[0]), not
+// view_src, which would skip in-place ops that did write. Never into a leaf: caches and states
+// are leaves that set_rows/cpy change during the graph.
+static const ggml_tensor * mmvq_src1_identity(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE && t->src[0] != nullptr && t->src[0]->op != GGML_OP_NONE) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+const void * ggml_cuda_mmvq_src1_cache_find(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, cudaStream_t stream) {
+    if (!ggml_cuda_mmvq_src1_cache_enabled()) {
+        return nullptr;
+    }
+    const ggml_tensor * id   = mmvq_src1_identity(src1);
+    const size_t        size = ggml_cuda_mmvq_q8_1_size(src1);
+    for (auto & c : ctx.mmvq_src1_cache) {
+        bool same = c.gen == ctx.graph_gen && c.tensor == id && c.data == src1->data && c.stream == stream && c.size >= size;
+        for (int i = 0; same && i < 4; ++i) {
+            same = c.ne[i] == src1->ne[i] && c.nb[i] == src1->nb[i];
+        }
+        if (same) {
+            c.used = ++ctx.mmvq_src1_tick;
+            return c.buf;
+        }
+    }
+    return nullptr;
+}
+
+void * ggml_cuda_mmvq_src1_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, cudaStream_t stream) {
+    if (!ggml_cuda_mmvq_src1_cache_enabled()) {
+        return nullptr;
+    }
+    const size_t size = ggml_cuda_mmvq_q8_1_size(src1);
+    auto * c = &ctx.mmvq_src1_cache[0];
+    if (ctx.mmvq_src1_cache[1].used < c->used) {
+        c = &ctx.mmvq_src1_cache[1];
+    }
+    if (c->buf == nullptr) {
+        // Allocated once and never moved: captured CUDA graphs keep this address. Not inside a
+        // capture; until then, or for a src1 larger than the buffer, the caller uses the pool.
+        cudaStreamCaptureStatus capture_status;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (capture_status == cudaStreamCaptureStatusNone) {
+            const size_t alloc = std::max(size, (size_t) 4 << 20);
+            CUDA_CHECK(cudaMalloc(&c->buf, alloc));
+            c->size = alloc;
+        }
+    }
+    if (c->size < size) {
+        return nullptr; // the slot keeps its own, still valid, contents
+    }
+    c->tensor = mmvq_src1_identity(src1);
+    c->data   = src1->data;
+    c->stream = stream;
+    c->gen    = ctx.graph_gen;
+    c->used   = ++ctx.mmvq_src1_tick;
+    for (int i = 0; i < 4; ++i) {
+        c->ne[i] = src1->ne[i];
+        c->nb[i] = src1->nb[i];
+    }
+    return c->buf;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1506,90 +1587,20 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
-    // fork: reuse the quantization when the previous mat-vec on this stream read the same src1
-    // tensor in this graph evaluation. On RDNA3 decode is launch-bound (~1600 kernels per token,
-    // GPU idle half the time); layers that project one input several ways re-quantize it each time.
+    // fork: reuse the quantization when an earlier mat-vec in this graph evaluation read the same
+    // src1, or a fused rms_norm already wrote it (norm.cu). See ggml_cuda_mmvq_src1_cache_find.
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
-    const char * src1_q8_1_ptr = nullptr;
-    {
-        static const bool cache_enabled = [] {
-            const char * off = getenv("GGML_CUDA_MMVQ_SRC1_CACHE");
-            const char * opt = getenv("GGML_CUDA_GRAPH_OPT"); // concurrent streams: one shared buffer would race
-            return !(off && atoi(off) == 0) && !(opt && atoi(opt) == 1);
-        }();
-        // A reshape writes nothing, so it names the same bytes as its parent: the routed experts
-        // read the FFN input reshaped, the shared expert reads it as is. Walk the direct parent
-        // (src[0]), not view_src, which would skip in-place ops that did write. Never into a leaf:
-        // caches and states are leaves that set_rows/cpy change during the graph.
-        const ggml_tensor * src1_id = src1;
-        while (src1_id->op == GGML_OP_RESHAPE && src1_id->src[0] != nullptr && src1_id->src[0]->op != GGML_OP_NONE) {
-            src1_id = src1_id->src[0];
+    const char * src1_q8_1_ptr = (const char *) ggml_cuda_mmvq_src1_cache_find(ctx, src1, stream);
+    if (src1_q8_1_ptr == nullptr) {
+        char * dst_q8_1 = (char *) ggml_cuda_mmvq_src1_cache_reserve(ctx, src1, stream);
+        if (dst_q8_1 == nullptr) {
+            dst_q8_1 = src1_q8_1.alloc(q8_1_size);
         }
-
-        auto matches = [&](const ggml_backend_cuda_context::mmvq_src1_cache_t & c) {
-            if (c.gen != ctx.graph_gen || c.tensor != src1_id || c.data != src1->data || c.stream != stream || c.size < q8_1_size) {
-                return false;
-            }
-            for (int i = 0; i < 4; ++i) {
-                if (c.ne[i] != src1->ne[i] || c.nb[i] != src1->nb[i]) {
-                    return false;
-                }
-            }
-            return true;
-        };
-
-        ggml_backend_cuda_context::mmvq_src1_cache_t * hit = nullptr;
-        for (auto & c : ctx.mmvq_src1_cache) {
-            if (cache_enabled && matches(c)) {
-                hit = &c;
-            }
-        }
-
-        if (hit != nullptr) {
-            hit->used = ++ctx.mmvq_src1_tick;
-            src1_q8_1_ptr = (const char *) hit->buf;
-        } else {
-            char * dst_q8_1 = nullptr;
-            auto * c = &ctx.mmvq_src1_cache[0];
-            if (ctx.mmvq_src1_cache[1].used < c->used) {
-                c = &ctx.mmvq_src1_cache[1];
-            }
-            if (cache_enabled) {
-                if (c->buf == nullptr) {
-                    // Allocated once and never moved: captured CUDA graphs keep this address. Not
-                    // inside a capture; a src1 larger than the buffer simply uses the pool.
-                    cudaStreamCaptureStatus capture_status;
-                    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
-                    if (capture_status == cudaStreamCaptureStatusNone) {
-                        const size_t size = std::max(q8_1_size, (size_t) 4 << 20);
-                        CUDA_CHECK(cudaMalloc(&c->buf, size));
-                        c->size = size;
-                    }
-                }
-                if (c->size >= q8_1_size) {
-                    dst_q8_1 = (char *) c->buf;
-                }
-            }
-            if (dst_q8_1 != nullptr) {
-                c->tensor = src1_id;
-                c->data   = src1->data;
-                c->stream = stream;
-                c->gen    = ctx.graph_gen;
-                c->used   = ++ctx.mmvq_src1_tick;
-                for (int i = 0; i < 4; ++i) {
-                    c->ne[i] = src1->ne[i];
-                    c->nb[i] = src1->nb[i];
-                }
-            } else {
-                dst_q8_1 = src1_q8_1.alloc(q8_1_size); // the slot keeps its own, still valid, contents
-            }
-
-            const int64_t s11 = src1->nb[1] / ts_src1;
-            const int64_t s12 = src1->nb[2] / ts_src1;
-            const int64_t s13 = src1->nb[3] / ts_src1;
-            quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-            src1_q8_1_ptr = dst_q8_1;
-        }
+        const int64_t s11 = src1->nb[1] / ts_src1;
+        const int64_t s12 = src1->nb[2] / ts_src1;
+        const int64_t s13 = src1->nb[3] / ts_src1;
+        quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8_1_ptr = dst_q8_1;
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;

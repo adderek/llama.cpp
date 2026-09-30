@@ -7,9 +7,10 @@
 // input again afterwards (hit in the second slot), three inputs cycling through the two slots
 // (evict, re-quantize), MUL_MAT_ID sharing an input, one input read both reshaped and as is
 // (hit), a reshape of an in-place result over the same bytes (miss), a leaf overwritten by the
-// graph and read again through a reshape (miss), and the same input last in one graph and first
-// in the next. The input changes on every compute, so a copy kept across graph
-// evaluations or baked into a captured CUDA graph shows up as a mismatch against the CPU
+// graph and read again through a reshape (miss), a fused rms_norm * weight that writes the q8_1
+// copy itself (one row, and three rows with a padded row length), and the same input last in
+// one graph and first in the next. The input changes on every compute, so a copy kept across
+// graph evaluations or baked into a captured CUDA graph shows up as a mismatch against the CPU
 // backend. Without a CUDA/HIP device the test passes.
 
 #include "ggml.h"
@@ -23,6 +24,7 @@
 
 static const int64_t K        = 4096;
 static const int64_t N        = 512;
+static const int64_t K2       = 1600; // not a multiple of MATRIX_ROW_PADDING: the q8_1 row is padded
 static const int     N_EXPERT = 4;
 
 struct net {
@@ -30,6 +32,7 @@ struct net {
     ggml_tensor  * x;
     ggml_tensor  * ids;
     ggml_tensor  * st;
+    ggml_tensor  * xr; // [K2, 3]
     std::vector<ggml_tensor *> weights;
     std::vector<ggml_tensor *> outs;
     ggml_cgraph  * gf;
@@ -44,12 +47,17 @@ static net build() {
     n.x   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
     n.ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, 1);
     n.st  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, 1);
+    n.xr  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K2, 3);
     ggml_tensor * w1 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K, N);
     ggml_tensor * w2 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K, N);
     ggml_tensor * w3 = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_K, K, N);
     ggml_tensor * e1 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, K, N, N_EXPERT);
     ggml_tensor * e2 = ggml_new_tensor_3d(ctx, GGML_TYPE_Q4_0, K, N, N_EXPERT);
-    n.weights = { w1, w2, w3, e1, e2 };
+    ggml_tensor * g  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K);  // rms_norm weights
+    ggml_tensor * gr = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, K2);
+    ggml_tensor * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, K2, N);
+    ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, K2, N);
+    n.weights = { w1, w2, w3, e1, e2, g, gr, wa, wb };
 
     ggml_tensor * x2 = ggml_scale(ctx, n.x, -0.5f);
     ggml_tensor * x3 = ggml_reshape_3d(ctx, n.x, K, 1, 1);
@@ -71,6 +79,13 @@ static net build() {
     n.outs.push_back(ggml_mul_mat(ctx, w2, n.st));        // a leaf, like a cache or a recurrent state...
     n.outs.push_back(ggml_cpy(ctx, x2, n.st));            // ...that the graph overwrites...
     n.outs.push_back(ggml_mul_mat(ctx, w3, ggml_reshape_2d(ctx, n.st, K, 1))); // ...and reads again: quantize
+    ggml_tensor * m  = ggml_mul(ctx, ggml_rms_norm(ctx, x4, 1e-6f), g); // fused rms_norm * weight writes the q8_1 copy itself
+    n.outs.push_back(ggml_mul_mat(ctx, w1, m));
+    n.outs.push_back(ggml_mul_mat_id(ctx, e2, ggml_reshape_3d(ctx, m, K, 1, 1), n.ids));
+    n.outs.push_back(ggml_mul_mat(ctx, w3, m));
+    ggml_tensor * mr = ggml_mul(ctx, ggml_rms_norm(ctx, n.xr, 1e-6f), gr); // three rows, padded q8_1 rows
+    n.outs.push_back(ggml_mul_mat(ctx, wa, mr));
+    n.outs.push_back(ggml_mul_mat(ctx, wb, mr));
     n.outs.push_back(ggml_mul_mat(ctx, w1, n.x));         // last read is x, so the next compute's first
                                                            // mat-vec would hit if the key ignored the graph
 
@@ -143,6 +158,12 @@ int main() {
         ggml_backend_tensor_set(g.x,   x.data(), 0, ggml_nbytes(g.x));
         ggml_backend_tensor_set(c.x,   x.data(), 0, ggml_nbytes(c.x));
         ggml_backend_tensor_set(g.st,  x.data(), 0, ggml_nbytes(g.st)); // the graph overwrote it last time
+        std::vector<float> xr(K2*3);
+        for (float & v : xr) {
+            v = rnd();
+        }
+        ggml_backend_tensor_set(g.xr,  xr.data(), 0, ggml_nbytes(g.xr));
+        ggml_backend_tensor_set(c.xr,  xr.data(), 0, ggml_nbytes(c.xr));
         ggml_backend_tensor_set(c.st,  x.data(), 0, ggml_nbytes(c.st));
         ggml_backend_tensor_set(g.ids, ids,      0, sizeof(ids));
         ggml_backend_tensor_set(c.ids, ids,      0, sizeof(ids));

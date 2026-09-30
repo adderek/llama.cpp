@@ -3551,6 +3551,31 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// fork: whether a mat-vec later in the graph will quantize `t` for MMVQ, so that a fused rms_norm
+// producing `t` should write the q8_1 copy as well. A wrong guess costs one extra write of a
+// q8_1 row, never correctness: MMVQ checks the cache key itself.
+static bool ggml_cuda_mmvq_will_read(const ggml_cgraph * cgraph, int i_producer, const ggml_tensor * t, int cc) {
+    if (!ggml_cuda_mmvq_src1_cache_enabled() || t->ne[1]*t->ne[2]*t->ne[3] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    const int i_end = std::min(cgraph->n_nodes, i_producer + 16);
+    for (int j = i_producer + 1; j < i_end; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src1 = n->src[1];
+        while (src1->op == GGML_OP_RESHAPE && src1->src[0] != nullptr && src1->src[0]->op != GGML_OP_NONE && src1 != t) {
+            src1 = src1->src[0];
+        }
+        if (src1 == t && ggml_is_quantized(n->src[0]->type) && !ggml_cuda_is_tq_weight_type(n->src[0]->type) &&
+            ggml_cuda_should_use_mmvq(n->src[0]->type, cc, n->src[1]->ne[1])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4271,7 +4296,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        const bool q8_1 = ggml_cuda_mmvq_will_read(cgraph, i + 1, cgraph->nodes[i + 1], ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            ggml_cuda_op_rms_norm_fused_q8_1(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        if (!q8_1) {
+            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        }
         return 1;
     }
 

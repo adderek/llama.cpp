@@ -155,8 +155,9 @@ status: [docs/fork/ROCM_RDNA3_PLAN.md](docs/fork/ROCM_RDNA3_PLAN.md).
 Decode is launch-bound on this card (about 1600 kernels per token, GPU idle half the time), so
 the mat-vec path keeps the last two q8_1 quantizations of its inputs and reuses one when a later
 mat-vec in the same graph evaluation reads the same tensor, or a reshape of it (Q/K/V projections,
-routed and shared expert gate/up). On Ornith-1.0-35B-A3B that removes 150 of 351
-`quantize_q8_1` launches per token, about +4–7% decode.
+routed and shared expert gate/up), and a fused rms_norm * weight writes that q8_1 copy itself
+when a mat-vec will read it. On Ornith-1.0-35B-A3B that removes 230 of 351 `quantize_q8_1`
+launches per token (1622 -> 1391 kernels), +7–8% decode; the output is bit-identical.
 `GGML_CUDA_MMVQ_SRC1_CACHE=0` turns it off; it is also off under `GGML_CUDA_GRAPH_OPT=1`.
 
 ## What runs where
