@@ -225,6 +225,7 @@ llama-server -m model.gguf -ngl 99 -fa on --cache-type-k turbo4 --cache-type-v t
 | `TURBO_INNERQ` | off | calibrate a per-channel scale over this many tokens before quantizing (`TURBO_INNERQ_STRENGTH`, 0–1, default 0.5) |
 | `LLAMA_STALL_WATCHDOG_SECS` | off | server: dump backtraces after this many seconds without progress (`LLAMA_STALL_WATCHDOG_GDB=0`: log only) |
 | `LLAMA_KEEP_HEAP_MAPPED` | `1` | server: `0` lets glibc return freed heap to the kernel again (reintroduces the prompt-cache fault) |
+| `LLAMA_MOE_HOT` and the other `LLAMA_MOE_*` | off | per-expert MoE tiering: hot experts on the GPU, cold ones in RAM or paged from the file with O_DIRECT; models permuted with `tools/moe-tier`. Variables and measurements: [tools/moe-tier/README.md](tools/moe-tier/README.md) |
 | `GGML_CUDA_MMVQ_SRC1_CACHE` | `1` | `0` turns off the reuse of q8_1 mat-vec inputs (and the fused rms_norm writing them) |
 
 `GGML_CUDA_GRAPH_OPT=1` (upstream, experimental) is not safe on this machine: on
@@ -250,6 +251,7 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
 | `test-fattn-long-kv` | FlashAttention evenly spread over 32k KV positions returns the value, not inf or a 20-67% error: the RDNA3 MMA kernel used to sum P*V in f16 |
 | `test-mul-mat-f16-range` | a large-batch mat-mul of Q6_K / Q2_K / F16 weights whose results pass the f16 range stays finite: the RDNA3 hipBLAS path used to write f16 |
+| `test-moe-tier` | a tiny qwen3moe split into hot and cold experts, through the arena and windowed paths and `moe-tier.py permute`, gives the logits of the untiered model (bit-identical on CPU, NMSE < 1e-12 on each GPU and both) |
 
 `test-fattn-turbo4`, `test-op-offload-devices`, `test-top-k-graph-capture` and the four fusion
 and cache tests above skip without a CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.

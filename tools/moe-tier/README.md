@@ -29,6 +29,7 @@ file layout.
 | `LLAMA_MOE_DIRECT=1` | page the cold experts from the file with O_DIRECT instead of reading them through the mmap; needs the settings below |
 | `LLAMA_MOE_ARENA=N` | experts pinned in the RAM arena (N x 61 layers x slab bytes, so size it against free RAM) |
 | `LLAMA_MOE_FRAMES=F` | replaceable frames on top of those; the arena path is used only while the ubatch routes to at most F experts, so prompt processing needs a small `-ub` |
+| `LLAMA_MOE_ARENA_HEADROOM=G` | GiB of RAM that must stay available after the arena is locked (default 32); below that the load fails at once, since with less it hung in the GPU driver |
 | `LLAMA_MOE_READERS=R` | threads issuing the page-ins (default 8); a single stream leaves most of the NVMe unused |
 | `LLAMA_MOE_STATS=1` | log hit/miss and where the routed experts fall in the permuted order |
 | `LLAMA_MOE_TRIM_EVERY=T` | drop those ranges every T decoded tokens (default 8) |
