@@ -2261,8 +2261,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         if (t == nullptr || w.lo == 0) {
                             return t;
                         }
-                        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], layer->n_slots - layer->n_warm,
-                                t->nb[1], t->nb[2], layer->n_warm*t->nb[2]);
+                        return ggml_view_3d(ctx0, t, t->ne[0], t->ne[1], w.n_frames,
+                                t->nb[1], t->nb[2], (layer->n_warm + w.frame0)*t->nb[2]);
                     };
 
                     ggml_tensor * out = build_moe_ffn_exps(cur, ids_w, selected_experts,

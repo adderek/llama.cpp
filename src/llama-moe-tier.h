@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -24,8 +25,10 @@ struct llama_moe_tier_layer {
     // a window of cold ids that one pass of the chunked (prefill) path pages into the frames
     struct window {
         llama_moe_tier_layer * layer;
-        int32_t lo; // first cold id of the window
-        int32_t hi; // one past the last
+        int32_t lo;     // first cold id of the window
+        int32_t hi;     // one past the last
+        int32_t frame0; // first frame of the window, counted from n_warm
+        int32_t n_frames;
     };
 
     struct arena {
@@ -48,8 +51,12 @@ struct llama_moe_tier_layer {
     std::vector<int64_t> slot_call;
     int64_t              call = 0;
 
-    // [0, n_slots), then n_slots - n_warm ids at a time; fixed after init so the graph can point at them
+    // [0, n_warm + n), then n ids at a time, n = all frames, or half of them with LLAMA_MOE_OVERLAP, where
+    // consecutive windows use alternate halves; fixed after init so the graph can point at them
     std::vector<window>  windows;
+
+    // LLAMA_MOE_OVERLAP: reads the next window into the other half of the frames while this one computes
+    std::thread prefetch;
 
     std::vector<struct ggml_tensor *> pending; // arenas whose data pointer is known only after load
 
@@ -79,6 +86,8 @@ struct llama_moe_tier_layer {
 
     // page in the queued (frame, expert) pairs, several at a time
     void load_slots(const std::vector<std::pair<int32_t, int32_t>> & load);
+
+    void wait_prefetch();
 };
 
 // ggml custom op: rewrite cold expert ids into arena slots, loading what is missing.

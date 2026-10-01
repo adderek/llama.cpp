@@ -256,10 +256,12 @@ int main(int argc, char ** argv) {
 
     // 16 experts, 4 used: 4 hot, 12 cold. The arena keeps 2 cold experts and pages the rest through 8 or 4 frames.
     // With 8 frames a ubatch of 2 tokens (8 routed slots) takes the decode path, with 4 frames a ubatch of 64
-    // takes the windowed path: windows [0,6) [6,10) [10,12).
+    // takes the windowed path: windows [0,6) [6,10) [10,12). With LLAMA_MOE_OVERLAP the windows are half as wide and
+// alternate between the two halves of the frames, one paged in while the other computes: [0,4) [4,6) [6,8) [8,10) [10,12).
     const std::string hot     = "LLAMA_MOE_HOT=4";
     const std::string decode  = hot + " LLAMA_MOE_DIRECT=1 LLAMA_MOE_ARENA=2 LLAMA_MOE_FRAMES=8";
     const std::string windows = hot + " LLAMA_MOE_DIRECT=1 LLAMA_MOE_ARENA=2 LLAMA_MOE_FRAMES=4";
+    const std::string overlap = windows + " LLAMA_MOE_OVERLAP=1";
 
     std::vector<std::string> devs;
     std::string gpus;
@@ -290,12 +292,14 @@ int main(int argc, char ** argv) {
         ok &= run(hot,     model, out(d + "hot-ub2"),      dev, 2);
         ok &= run(decode,  model, out(d + "decode-ub2"),   dev, 2);
         ok &= run(windows, model, out(d + "windows-ub64"), dev, 64);
+        ok &= run(overlap, model, out(d + "overlap-ub64"), dev, 64);
 
         // the split into hot and cold is exact on the CPU; on a GPU, cold experts run on the host or are offloaded
         ok &= compare("hot/cold split, ubatch 64",               out(d + "ref-ub64"), out(d + "hot-ub64"),     cpu);
         ok &= compare("hot/cold split, ubatch 2",                out(d + "ref-ub2"),  out(d + "hot-ub2"),      cpu);
         ok &= compare("arena, decode path (frames round-robin)", out(d + "hot-ub2"),  out(d + "decode-ub2"),   cpu);
         ok &= compare("arena, windowed path",                    out(d + "hot-ub64"), out(d + "windows-ub64"), cpu);
+        ok &= compare("arena, windowed path, read overlapped",   out(d + "hot-ub64"), out(d + "overlap-ub64"), cpu);
     }
 
     // tools/moe-tier permute: reordering the experts must not change the model

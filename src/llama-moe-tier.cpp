@@ -27,7 +27,13 @@ static size_t llama_moe_tier_readers() {
 }
 #define LLAMA_MOE_TIER_READERS llama_moe_tier_readers()
 
+static bool llama_moe_tier_overlap() {
+    static const bool overlap = getenv("LLAMA_MOE_OVERLAP") && atoi(getenv("LLAMA_MOE_OVERLAP")) != 0;
+    return overlap;
+}
+
 llama_moe_tier_layer::~llama_moe_tier_layer() {
+    wait_prefetch();
 #if defined(__linux__)
     if (fd != -1) {
         close(fd);
@@ -45,11 +51,20 @@ void llama_moe_tier_layer::init(int64_t n_warm_, int64_t n_slots_) {
 
 void llama_moe_tier_layer::init_windows() {
     const int64_t n_frames = n_slots - n_warm;
+    const int64_t n_win    = llama_moe_tier_overlap() && n_frames >= 2 ? n_frames/2 : n_frames;
 
     windows.clear();
-    windows.push_back({ this, 0, (int32_t) std::min(n_slots, n_cold) });
-    for (int64_t lo = n_slots; lo < n_cold; lo += n_frames) {
-        windows.push_back({ this, (int32_t) lo, (int32_t) std::min(lo + n_frames, n_cold) });
+    windows.push_back({ this, 0, (int32_t) std::min(n_warm + n_win, n_cold), 0, (int32_t) n_win });
+    int32_t half = 1;
+    for (int64_t lo = n_warm + n_win; lo < n_cold; lo += n_win) {
+        windows.push_back({ this, (int32_t) lo, (int32_t) std::min(lo + n_win, n_cold), half*(int32_t) (n_frames - n_win), (int32_t) n_win });
+        half = n_win < n_frames ? 1 - half : 0;
+    }
+}
+
+void llama_moe_tier_layer::wait_prefetch() {
+    if (prefetch.joinable()) {
+        prefetch.join();
     }
 }
 
@@ -217,6 +232,7 @@ void llama_moe_tier_map_ids(struct ggml_tensor * dst, const struct ggml_tensor *
     GGML_ASSERT(a->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_are_same_shape(a, dst));
 
+    layer->wait_prefetch();
     layer->call++;
 
     std::vector<std::pair<int32_t, int32_t>> load;
@@ -258,6 +274,9 @@ void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tenso
     GGML_ASSERT(a->type == GGML_TYPE_I32 && dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_are_same_shape(a, dst));
 
+    // the previous window may have started reading this one
+    layer->wait_prefetch();
+
     const bool first = w->lo == 0;
 
     std::vector<std::pair<int32_t, int32_t>> load;
@@ -293,7 +312,7 @@ void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tenso
             }
 
             // every id of the window has a frame of its own, so nothing the pass needs is replaced
-            const int32_t slot = (int32_t) (layer->n_warm + (id - std::max<int64_t>(w->lo, layer->n_warm)));
+            const int32_t slot = (int32_t) (layer->n_warm + w->frame0 + (id - std::max<int64_t>(w->lo, layer->n_warm)));
             if (layer->slot_expert[slot] != id) {
                 layer->slot_expert[slot] = id;
                 layer->n_miss++;
@@ -301,10 +320,39 @@ void llama_moe_tier_map_window(struct ggml_tensor * dst, const struct ggml_tenso
             } else {
                 layer->n_hit++;
             }
-            // windows after the first index their own view, which starts at the first frame
-            dst_row[i0] = first ? slot : slot - (int32_t) layer->n_warm;
+            // windows after the first index their own view, which starts at the window's first frame
+            dst_row[i0] = first ? slot : slot - (int32_t) layer->n_warm - w->frame0;
         }
     }
 
     layer->load_slots(load);
+
+    const size_t iw = w - layer->windows.data();
+    if (!llama_moe_tier_overlap() || iw + 1 >= layer->windows.size()) {
+        return;
+    }
+
+    // read the next window while this one computes: its frames were last read by the pass before this one, which is done
+    const auto & nw = layer->windows[iw + 1];
+    std::vector<std::pair<int32_t, int32_t>> next;
+    for (int64_t i1 = 0; i1 < a->ne[1]; ++i1) {
+        const int32_t * src_row = (const int32_t *) ((const char *) a->data + i1*a->nb[1]);
+        for (int64_t i0 = 0; i0 < a->ne[0]; ++i0) {
+            const int32_t id = src_row[i0];
+            if (id < nw.lo || id >= nw.hi || id < layer->n_warm) {
+                continue;
+            }
+            const int32_t slot = (int32_t) (layer->n_warm + nw.frame0 + (id - std::max<int64_t>(nw.lo, layer->n_warm)));
+            if (layer->slot_expert[slot] != id) {
+                layer->slot_expert[slot] = id;
+                // the next window counts every slot of this expert as a hit, this read included
+                layer->n_miss++;
+                layer->n_hit--;
+                next.emplace_back(slot, id);
+            }
+        }
+    }
+    if (!next.empty()) {
+        layer->prefetch = std::thread([layer, next = std::move(next)]() { layer->load_slots(next); });
+    }
 }
