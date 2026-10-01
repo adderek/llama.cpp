@@ -56,6 +56,12 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         return;
     }
 
+    // fork: GGML_TEST_INPUT_SCALE widens every uniform input, to find backends that keep an
+    // intermediate in f16 and overflow where the CPU stays finite (see test-mul-mat-f16-range)
+    static const float input_scale = getenv("GGML_TEST_INPUT_SCALE") ? atof(getenv("GGML_TEST_INPUT_SCALE")) : 1.0f;
+    min *= input_scale;
+    max *= input_scale;
+
     size_t nels = ggml_nelements(tensor);
     std::vector<float> data(nels);
     {

@@ -4,7 +4,12 @@
 // dequantized to f16 for a hipBLAS GEMM. Its output used to be f16 too, so any result past
 // 65504 became inf, then NaN downstream: Ornith-1.5-397B answered only "/" with a 512-token
 // ubatch. Here the activations are large enough that every output is around 1e5, and the
-// result must match the CPU. Without a CUDA/HIP device the test passes.
+// result must match the CPU.
+//
+// Q4_1 and Q5_1 had a second overflow, in the mat-vec path (one row): the dot product
+// multiplied the block minimum of the weights by the block sum of the activations in half2.
+// Those cases use weights in [-100, 100], so that product reaches ~1e5. Without a CUDA/HIP
+// device the test passes.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -33,8 +38,8 @@ int main() {
     ggml_backend_t bes[2] = { ggml_backend_dev_init(gpu, nullptr), ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr) };
 
     const int64_t K = 1024, N = 256;
-    const ggml_type types[] = { GGML_TYPE_Q6_K, GGML_TYPE_Q2_K, GGML_TYPE_F16 };
-    const int64_t   rows[]  = { 64, 512 }; // below and above the MMQ cut-off
+    const ggml_type types[] = { GGML_TYPE_Q6_K, GGML_TYPE_Q2_K, GGML_TYPE_F16, GGML_TYPE_Q4_1, GGML_TYPE_Q5_1 };
+    const int64_t   rows[]  = { 1, 64, 512 }; // mat-vec, below and above the MMQ cut-off
 
     int n_fail = 0;
     for (ggml_type type : types) {
@@ -57,7 +62,8 @@ int main() {
                     return (float) (seed >> 8) / (float) (1u << 24);
                 };
                 std::vector<float> wf(ggml_nelements(w)), xf(ggml_nelements(x));
-                for (float & v : wf) { v = 0.25f + 0.5f*rnd(); }
+                const bool with_min = type == GGML_TYPE_Q4_1 || type == GGML_TYPE_Q5_1;
+                for (float & v : wf) { v = with_min ? 200.0f*rnd() - 100.0f : 0.25f + 0.5f*rnd(); }
                 for (float & v : xf) { v = 100.0f + 200.0f*rnd(); }
                 std::vector<uint8_t> wq(ggml_nbytes(w));
                 ggml_quantize_chunk(type, wf.data(), wq.data(), 0, N, K, nullptr);

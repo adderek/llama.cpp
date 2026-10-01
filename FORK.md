@@ -179,6 +179,10 @@ for 0-1.4% of prefill speed with 256-wide heads and up to 3.7% with 128-wide hea
 Also on RDNA3, Q2_K, Q6_K and IQ2 weights left MMQ above 128 rows for a hipBLAS GEMM with an f16
 output, which overflowed on large activations (Ornith-1.5-397B answered only "/" at ubatch 512).
 They now stay on MMQ, and the remaining hipBLAS f16 path writes f32 (-1 to -2% prefill).
+The Q4_1 / Q5_1 / Q8_1 dot products multiplied the block scales in half2 as well; the block
+minimum times the activation sum overflowed in the mat-vec path. They multiply in f32 now.
+`GGML_TEST_INPUT_SCALE=N` widens every input of `test-backend-ops` by N, which is how that one
+was found (at 100 it was the only op that went to inf where the CPU stayed finite).
 
 ## What runs where
 
@@ -250,7 +254,7 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-add-unary-mul-fusion` | fused `op(x + bias) * g` gives the bits of the unfused kernels |
 | `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
 | `test-fattn-long-kv` | FlashAttention evenly spread over 32k KV positions returns the value, not inf or a 20-67% error: the RDNA3 MMA kernel used to sum P*V in f16 |
-| `test-mul-mat-f16-range` | a large-batch mat-mul of Q6_K / Q2_K / F16 weights whose results pass the f16 range stays finite: the RDNA3 hipBLAS path used to write f16 |
+| `test-mul-mat-f16-range` | mat-muls whose results pass the f16 range stay finite: Q6_K / Q2_K / F16 at large batch (the RDNA3 hipBLAS path wrote f16), Q4_1 / Q5_1 at one row (half2 block-scale product) |
 | `test-moe-tier` | a tiny qwen3moe split into hot and cold experts, through the arena and windowed paths and `moe-tier.py permute`, gives the logits of the untiered model (bit-identical on CPU, NMSE < 1e-12 on each GPU and both) |
 
 `test-fattn-turbo4`, `test-op-offload-devices`, `test-top-k-graph-capture` and the four fusion
