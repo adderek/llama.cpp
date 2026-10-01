@@ -1967,6 +1967,35 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     ggml_backend_buffer_get_size(moe_arena_buf.get())/1024.0/1024.0);
         }
 
+#if defined(__linux__)
+        // The arena is locked in RAM below. If that leaves too little memory, loading does not fail:
+        // it hangs in the GPU driver (a KV buffer clear waited 15+ min while TTM evicted under host
+        // memory pressure). 78 GiB of arena hung with ~23 GiB available afterwards and loaded with
+        // ~38 GiB, 54 GiB loaded with ~47 GiB; so refuse below LLAMA_MOE_ARENA_HEADROOM GiB (32).
+        if (moe_arena_buf) {
+            const size_t size = ggml_backend_buffer_get_size(moe_arena_buf.get());
+            long long avail_kib = -1;
+            if (FILE * f = fopen("/proc/meminfo", "r")) {
+                char line[256];
+                while (fgets(line, sizeof(line), f)) {
+                    if (sscanf(line, "MemAvailable: %lld kB", &avail_kib) == 1) {
+                        break;
+                    }
+                }
+                fclose(f);
+            }
+            const char * env_headroom = getenv("LLAMA_MOE_ARENA_HEADROOM");
+            const double headroom_gib = env_headroom ? atof(env_headroom) : 32.0;
+            const double after_gib    = avail_kib / 1048576.0 - size / 1073741824.0;
+            if (avail_kib >= 0 && after_gib < headroom_gib) {
+                throw std::runtime_error(format(
+                    "the MoE arena (%.1f GiB) would leave %.1f GiB of RAM available, below the %.1f GiB headroom "
+                    "(LLAMA_MOE_ARENA_HEADROOM); lower LLAMA_MOE_ARENA / LLAMA_MOE_FRAMES or free memory",
+                    size / 1073741824.0, after_gib, headroom_gib));
+            }
+        }
+#endif
+
         const int fd = moe_arena_buf ? llama_moe_tier_open_direct(ml.files[0]->file_id()) : -1;
         if (fd == -1) {
             LLAMA_LOG_WARN("%s: no O_DIRECT handle for the model file, LLAMA_MOE_DIRECT is off\n", __func__);
