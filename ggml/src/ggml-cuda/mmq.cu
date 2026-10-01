@@ -420,14 +420,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 
             // For some quantization types MMQ can have lower peak TOPS than hipBLAS
             //     so it's only faster for sufficiently small batch sizes:
+            // fork: Q2_K, Q6_K and IQ2 stay on MMQ at every batch size: the hipBLAS path
+            // dequantizes to f16 and overflowed on large activations, see test-mul-mat-f16-range.
             switch (type) {
-                case GGML_TYPE_Q2_K:
-                    return ne11 <= 128;
-                case GGML_TYPE_Q6_K:
-                    return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
-                case GGML_TYPE_IQ2_XS:
-                case GGML_TYPE_IQ2_S:
-                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
                 case GGML_TYPE_IQ1_M:
                     // turboquant mmq uses a lossy scale approximation that fails tests at mmq_x=16 (n>=9);
                     // fall back to hipBLAS dequant for correctness until the implementation is fixed.

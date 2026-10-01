@@ -358,6 +358,7 @@ llama_build_and_test(test-sigmoid-gate-fusion.cpp) # fork: fused shared expert g
 llama_build_and_test(test-add-unary-mul-fusion.cpp) # fork: fused op(x + bias) * g, same bits as unfused
 llama_build_and_test(test-gdn-beta-sigmoid-fusion.cpp) # fork: GDN applies sigmoid(beta) itself, same bits
 llama_build_and_test(test-fattn-long-kv.cpp) # fork: FA over 32k KV positions, no f16 accumulator overflow
+llama_build_and_test(test-mul-mat-f16-range.cpp) # fork: hipBLAS mat-mul past the f16 range, no inf
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

@@ -1583,7 +1583,10 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     bool prefer_f32_output = false;
     if (compute_type == GGML_TYPE_F16) {
-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+        // fork: RDNA3 too. An f16 C overflows past 65504: Q6_K weights take this path above 128
+        // rows on RDNA3 (no MMQ there), and Ornith-1.5-397B's activations reach that range.
+        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc) ||
+                            GGML_CUDA_CC_IS_RDNA3(cc);
     } else if (compute_type == GGML_TYPE_BF16) {
         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
     }
