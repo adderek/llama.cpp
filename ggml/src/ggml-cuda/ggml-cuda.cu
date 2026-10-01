@@ -2766,7 +2766,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
-static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
+// returns false if re-instantiating the graph ran out of memory
+static bool ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
 #if CUDART_VERSION >= 12000
@@ -2788,10 +2789,15 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        const cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+        if (err == cudaErrorMemoryAllocation) {
+            return false;
+        }
+        CUDA_CHECK(err);
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
+    return true;
 }
 #endif // USE_CUDA_GRAPH
 
@@ -4635,11 +4641,29 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+        bool instantiated = true;
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            const cudaError_t err = cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0);
+            if (err != cudaErrorMemoryAllocation) {
+                CUDA_CHECK(err);
+            }
+            instantiated = err == cudaSuccess;
+        } else if (cuda_graph_update_required) { // Update graph executable
+            instantiated = ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
-        if (cuda_graph_update_required) { // Update graph executable
-            ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
+        if (!instantiated) {
+            // fork: a full card used to abort the process here. The capture only recorded the
+            // kernels, so turn graphs off for this graph and evaluate it directly instead.
+            (void) cudaGetLastError();
+            GGML_LOG_WARN("%s: out of memory instantiating a CUDA graph on device %d, running without CUDA graphs for it\n",
+                          __func__, cuda_ctx->device);
+            graph->disable_due_to_oom = true;
+            graph->instance = nullptr;
+            CUDA_CHECK(cudaGraphDestroy(graph->graph));
+            graph->graph = nullptr;
+            cuda_ctx->graph_gen++; // the capture filled mmvq cache slots whose kernels never ran
+            ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, false, false, graph_key);
+            return;
         }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
