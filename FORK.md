@@ -176,6 +176,10 @@ output was off by NMSE 2e-3 against the CPU (VEC kernel: 1e-5). The fork keeps i
 4e-8): perplexity at 32k context 2.4127 -> 2.4097 (Qwen3.8-27B), 2.8822 -> 2.8714 (Ministral-8B),
 for 0-1.4% of prefill speed with 256-wide heads and up to 3.7% with 128-wide heads at depth 16k.
 
+Also on RDNA3, Q2_K, Q6_K and IQ2 weights left MMQ above 128 rows for a hipBLAS GEMM with an f16
+output, which overflowed on large activations (Ornith-1.5-397B answered only "/" at ubatch 512).
+They now stay on MMQ, and the remaining hipBLAS f16 path writes f32 (-1 to -2% prefill).
+
 ## What runs where
 
 | | RX 7900 XTX (gfx1100) | other RDNA3 (gfx1101/1102) | RDNA4 / CDNA | NVIDIA (CUDA) | CPU | Metal / Vulkan / SYCL |
@@ -245,6 +249,7 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-add-unary-mul-fusion` | fused `op(x + bias) * g` gives the bits of the unfused kernels |
 | `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
 | `test-fattn-long-kv` | FlashAttention evenly spread over 32k KV positions returns the value, not inf or a 20-67% error: the RDNA3 MMA kernel used to sum P*V in f16 |
+| `test-mul-mat-f16-range` | a large-batch mat-mul of Q6_K / Q2_K / F16 weights whose results pass the f16 range stays finite: the RDNA3 hipBLAS path used to write f16 |
 
 `test-fattn-turbo4`, `test-op-offload-devices`, `test-top-k-graph-capture` and the four fusion
 and cache tests above skip without a CUDA/HIP device; `test-turbo-kv-*` also run on the CPU backend.
