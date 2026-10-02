@@ -506,6 +506,10 @@ struct server_metrics {
 
 std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int idx, size_t n_top);
 
+// top n_top tokens with probabilities (sorted) and the probability of `tok`, in two passes over the
+// logits without copying them; falls back to get_token_probabilities for n_top > 32
+std::vector<llama_token_data> get_token_probabilities_top(llama_context * ctx, int idx, size_t n_top, llama_token tok, float & p_tok);
+
 std::string safe_json_to_str(const json & data);
 
 std::string tokens_to_str(llama_context * ctx, const llama_tokens & tokens);

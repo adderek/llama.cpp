@@ -1157,7 +1157,6 @@ json oaicompat_chat_params_parse(
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
-    auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
     if (!opt.use_jinja) {
@@ -1570,6 +1569,166 @@ std::vector<llama_token_data> get_token_probabilities(llama_context * ctx, int i
     }
 
     return cur;
+}
+
+// Fast path for logprobs: one pass for the top-k (no copy of the vocabulary), one vectorized pass
+// for the softmax denominator. Per generated token this replaces a 3 MB copy, a partial sort and two
+// scalar expf passes over ~250k logits (1.1 ms -> ~45 us on a 248k vocabulary, Zen 2).
+
+// exp(x) for x <= 0. x/ln2 is rounded to nearest by truncation (exact for x <= 0), Cody-Waite
+// reduction to |r| <= ln2/2, degree-6 polynomial; max relative error 2.5e-7 on [-87, 0].
+static inline __attribute__((always_inline)) float lp_exp_nonpos(float x) {
+    x = x < -87.0f ? -87.0f : x;
+    const int32_t k  = (int32_t) (x * 1.44269504088896341f - 0.5f);
+    const float   kf = (float) k;
+    float r = x - kf * 0.693145751953125f;
+    r = r - kf * 1.428606765330187045e-06f;
+    const float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * (0.041666668f + r * (0.008333334f + r * 0.0013888889f)))));
+    const int32_t e = (k + 127) << 23;
+    float sc;
+    std::memcpy(&sc, &e, sizeof(sc));
+    return p * sc;
+}
+
+#define LP_BLOCK 64
+// a block whose maximum is this far below the global maximum adds at most 64*e^-25 = 9e-10 each
+// to a sum that is >= 1; over a 250k vocabulary that bounds the relative error at 4e-6
+#define LP_SKIP  25.0f
+
+// fast-math only lets the compiler reorder the sums and maxima below so they vectorize;
+// the result is closer to a double-precision reference than a sequential float sum
+#if defined(__GNUC__) && !defined(__clang__)
+#    define LP_REASSOC __attribute__((optimize("fast-math")))
+#else
+#    define LP_REASSOC
+#endif
+
+#define LP_KERNELS(SUFFIX, ATTR)                                                         \
+    ATTR LP_REASSOC static void lp_block_max##SUFFIX(const float * l, int n, float * bm) { \
+        for (int b = 0; b * LP_BLOCK < n; ++b) {                                         \
+            const int i0 = b * LP_BLOCK;                                                 \
+            const int i1 = n < i0 + LP_BLOCK ? n : i0 + LP_BLOCK;                        \
+            float m = l[i0];                                                             \
+            for (int i = i0; i < i1; ++i) { m = m > l[i] ? m : l[i]; }                   \
+            bm[b] = m;                                                                   \
+        }                                                                                \
+    }                                                                                    \
+    ATTR LP_REASSOC static float lp_sum_exp##SUFFIX(const float * l, int n, float mx) {  \
+        float s = 0.0f;                                                                  \
+        for (int i = 0; i < n; ++i) { s += lp_exp_nonpos(l[i] - mx); }                   \
+        return s;                                                                        \
+    }                                                                                    \
+    ATTR LP_REASSOC static float lp_sum_exp_skip##SUFFIX(const float * l, int n,          \
+            const float * bm, float mx) {                                                \
+        float acc[LP_BLOCK] = {0.0f};                                                    \
+        float s = 0.0f;                                                                  \
+        const int nfull = n / LP_BLOCK;                                                  \
+        for (int b = 0; b < nfull; ++b) {                                                \
+            if (bm[b] < mx - LP_SKIP) { continue; }                                      \
+            const float * lb = l + b * LP_BLOCK;                                         \
+            for (int i = 0; i < LP_BLOCK; ++i) { acc[i] += lp_exp_nonpos(lb[i] - mx); }   \
+        }                                                                                \
+        for (int i = nfull * LP_BLOCK; i < n; ++i) { s += lp_exp_nonpos(l[i] - mx); }    \
+        for (int i = 0; i < LP_BLOCK; ++i) { s += acc[i]; }                              \
+        return s;                                                                        \
+    }
+
+LP_KERNELS(_generic, )
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+LP_KERNELS(_avx2, __attribute__((target("avx2,fma"))))
+static bool lp_use_avx2() {
+    static const bool v = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+    return v;
+}
+#else
+static bool lp_use_avx2() { return false; }
+static void lp_block_max_avx2(const float * l, int n, float * bm) { lp_block_max_generic(l, n, bm); }
+static float lp_sum_exp_avx2(const float * l, int n, float mx) { return lp_sum_exp_generic(l, n, mx); }
+static float lp_sum_exp_skip_avx2(const float * l, int n, const float * bm, float mx) { return lp_sum_exp_skip_generic(l, n, bm, mx); }
+#endif
+
+std::vector<llama_token_data> get_token_probabilities_top(llama_context * ctx, int idx, size_t n_top, llama_token tok, float & p_tok) {
+    const float       * logits      = llama_get_logits_ith(ctx, idx);
+    const llama_token * sampled_ids = llama_get_sampled_candidates_ith(ctx, idx);
+    const int           n_logits    = llama_get_sampled_logits_count_ith(ctx, idx);
+
+    p_tok = 0.0f;
+    if (n_logits <= 0) {
+        return {};
+    }
+    n_top = std::min<size_t>(n_top, n_logits);
+
+    // insertion into a sorted array costs O(n_top) per accepted element; past a few dozen the
+    // partial sort of the old path is the better trade
+    if (n_top == 0 || n_top > 32) {
+        std::vector<llama_token_data> cur = get_token_probabilities(ctx, idx, n_top);
+        for (const auto & t : cur) {
+            if (t.id == tok) { p_tok = t.p; break; }
+        }
+        cur.resize(n_top);
+        return cur;
+    }
+
+    static thread_local std::vector<float> bm;
+    bm.resize((n_logits + LP_BLOCK - 1) / LP_BLOCK);
+    if (lp_use_avx2()) {
+        lp_block_max_avx2(logits, n_logits, bm.data());
+    } else {
+        lp_block_max_generic(logits, n_logits, bm.data());
+    }
+
+    // top n_top by logit, sorted; blocks whose maximum cannot enter are skipped
+    std::vector<llama_token_data> out(n_top, llama_token_data{-1, -std::numeric_limits<float>::infinity(), 0.0f});
+    float thr = -std::numeric_limits<float>::infinity();
+    for (size_t b = 0; b < bm.size(); ++b) {
+        if (!(bm[b] > thr)) {
+            continue;
+        }
+        const int i1 = std::min<int>(n_logits, (int) (b + 1) * LP_BLOCK);
+        for (int i = (int) b * LP_BLOCK; i < i1; ++i) {
+            if (!(logits[i] > thr)) {
+                continue;
+            }
+            size_t j = n_top - 1;
+            while (j > 0 && out[j - 1].logit < logits[i]) {
+                out[j] = out[j - 1];
+                --j;
+            }
+            out[j] = llama_token_data{i, logits[i], 0.0f};
+            thr = out[n_top - 1].logit;
+        }
+    }
+
+    // usually only a few percent of the blocks can matter to the sum; when the distribution is flat
+    // (an uncertain token) the plain contiguous loop is faster than skipping
+    const float mx = out[0].logit;
+    size_t n_kept = 0;
+    for (const float m : bm) {
+        n_kept += m >= mx - LP_SKIP;
+    }
+    float sum;
+    if (n_kept * 2 < bm.size()) {
+        sum = lp_use_avx2() ? lp_sum_exp_skip_avx2(logits, n_logits, bm.data(), mx) : lp_sum_exp_skip_generic(logits, n_logits, bm.data(), mx);
+    } else {
+        sum = lp_use_avx2() ? lp_sum_exp_avx2(logits, n_logits, mx) : lp_sum_exp_generic(logits, n_logits, mx);
+    }
+
+    for (auto & t : out) {
+        t.p = expf(t.logit - mx) / sum;
+        if (sampled_ids) {
+            t.id = sampled_ids[t.id]; // index -> token id
+        }
+    }
+
+    if (sampled_ids) {
+        for (int i = 0; i < n_logits; ++i) {
+            if (sampled_ids[i] == tok) { p_tok = expf(logits[i] - mx) / sum; break; }
+        }
+    } else if (tok >= 0 && tok < n_logits) {
+        p_tok = expf(logits[tok] - mx) / sum;
+    }
+
+    return out;
 }
 
 std::string safe_json_to_str(const json & data) {

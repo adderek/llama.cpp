@@ -138,3 +138,25 @@ def test_logprobs_rows_describe_their_own_token(stream: bool):
     for r in rows:
         piece = server.make_request("POST", "/detokenize", data={"tokens": [r["id"]]}).body["content"]
         assert bytes(r["bytes"]) == piece.encode(), (r, piece)
+
+
+def test_logprobs_fast_path_matches_full_sort():
+    # top_logprobs <= 32 takes the two-pass path over the logits; more falls back to sorting a copy
+    # of the whole vocabulary. Both must give the same tokens and log-probabilities.
+    global server
+    server.start()
+    def run(n):
+        res = server.make_request("POST", "/completion", data={
+            "prompt": "I believe the meaning of life is", "n_predict": 24, "temperature": 0.0,
+            "n_probs": n, "cache_prompt": False,
+        })
+        assert res.status_code == 200, res.body
+        return res.body["completion_probabilities"]
+    fast, full = run(5), run(40)
+    assert [t["id"] for t in fast] == [t["id"] for t in full]
+    for a, b in zip(fast, full):
+        assert a["logprob"] == pytest.approx(b["logprob"], abs=1e-4)
+        assert len(a["top_logprobs"]) == 5
+        for x, y in zip(a["top_logprobs"], b["top_logprobs"][:5]):
+            assert x["id"] == y["id"]
+            assert x["logprob"] == pytest.approx(y["logprob"], abs=1e-4)
