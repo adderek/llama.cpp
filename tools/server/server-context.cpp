@@ -2003,6 +2003,13 @@ private:
         }
 
         if (incomplete) {
+            // the text goes out with the token that completes the character, but this token
+            // still gets its own probs entry, as a held-back stop-word prefix does
+            result.text_to_send = "";
+            slot.add_token(result);
+            if (slot.task->params.stream) {
+                send_partial_response(slot, result, false);
+            }
             slot.has_next_token = true;
         }
 
@@ -2200,6 +2207,7 @@ private:
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
             res->prob_output = tkn; // copy the token probs
+            res->has_prob_output = !is_begin && !is_progress;
         }
 
         // populate timings if this is final response or timings_per_token is enabled
@@ -2254,7 +2262,7 @@ private:
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
-            if (!slot.task->params.stream && slot.stop == STOP_TYPE_WORD) {
+            if (slot.stop == STOP_TYPE_WORD) {
                 const llama_tokens stop_word_toks = common_tokenize(ctx_tgt, slot.stopping_word, false);
 
                 size_t safe_offset = std::min(slot.generated_token_probs.size(), stop_word_toks.size());

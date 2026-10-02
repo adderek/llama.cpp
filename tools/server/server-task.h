@@ -101,6 +101,27 @@ struct task_params {
     json to_json(bool only_metrics = false) const;
 };
 
+struct completion_token_output {
+    llama_token tok;
+    float prob;
+    std::string text_to_send;
+    struct prob_info {
+        llama_token tok;
+        std::string txt;
+        float prob;
+    };
+    std::vector<prob_info> probs;
+
+    json to_json(bool post_sampling_probs) const;
+
+    static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
+
+    static float logarithm(float x);
+
+    static std::vector<unsigned char> str_to_bytes(const std::string & str);
+
+};
+
 // struct for tracking the state of a task (e.g., for streaming)
 struct task_result_state {
     // tracking diffs for partial tool calls
@@ -110,6 +131,11 @@ struct task_result_state {
     std::string generated_text; // append new chunks of generated text here
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
+
+    // for OpenAI chat streaming with logprobs: token probs not yet attached to a chunk,
+    // because the parser held their text back (tool call / reasoning markup, partial UTF-8)
+    std::vector<completion_token_output> pending_probs;
+    size_t n_probs_sent = 0;
 
     // for OpenAI Responses and Anthropic streaming API:
     // track output item / content block state across chunks
@@ -296,26 +322,6 @@ struct server_task_result {
 // using shared_ptr for polymorphism of server_task_result
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
 
-struct completion_token_output {
-    llama_token tok;
-    float prob;
-    std::string text_to_send;
-    struct prob_info {
-        llama_token tok;
-        std::string txt;
-        float prob;
-    };
-    std::vector<prob_info> probs;
-
-    json to_json(bool post_sampling_probs) const;
-
-    static json probs_vector_to_json(const std::vector<completion_token_output> & probs, bool post_sampling_probs);
-
-    static float logarithm(float x);
-
-    static std::vector<unsigned char> str_to_bytes(const std::string & str);
-
-};
 
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
@@ -349,6 +355,7 @@ struct server_task_result_cmpl_final : server_task_result {
     common_chat_msg    oaicompat_msg; // to be populated by update()
 
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
+    std::vector<completion_token_output> probs_stream; // probs not yet sent in a partial, set by update()
     bool is_updated = false;
 
     // for OpenAI Responses API
@@ -365,6 +372,12 @@ struct server_task_result_cmpl_final : server_task_result {
     virtual void update(task_result_state & state) override {
         is_updated = true;
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+
+        if (stream && state.n_probs_sent < probs_output.size()) {
+            probs_stream.assign(probs_output.begin() + state.n_probs_sent, probs_output.end());
+        }
+        state.pending_probs.clear();
+        state.n_probs_sent = probs_output.size();
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
@@ -405,6 +418,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     bool is_begin = false; // whether to send 200 status to HTTP client (begin of SSE stream)
                            // ref: https://github.com/ggml-org/llama.cpp/pull/23884
     completion_token_output prob_output;
+    bool has_prob_output = false; // n_probs > 0 and this partial carries a generated token
     server_slot_stats stats;
     result_prompt_progress progress;
 
@@ -414,6 +428,7 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
+    std::vector<completion_token_output> probs_stream; // probs to attach to this chunk, set by update()
     bool is_updated = false;
 
     // Streaming state copied from task_result_state for this chunk

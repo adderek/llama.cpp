@@ -484,6 +484,15 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         });
     }
 
+    // probs of tokens the partials could not attach go on the last content chunk,
+    // or on the finish chunk below when there is none
+    const bool probs_on_finish = deltas.empty();
+    if (!probs_stream.empty() && !probs_on_finish) {
+        deltas.back().at("choices").at(0)["logprobs"] = json {
+            {"content", completion_token_output::probs_vector_to_json(probs_stream, post_sampling_probs)},
+        };
+    }
+
     deltas.push_back({
         {"choices", json::array({
             json {
@@ -498,6 +507,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
         {"system_fingerprint", std::string(llama_build_info())},
         {"object",             "chat.completion.chunk"},
     });
+    if (!probs_stream.empty() && probs_on_finish) {
+        deltas.back().at("choices").at(0)["logprobs"] = json {
+            {"content", completion_token_output::probs_vector_to_json(probs_stream, post_sampling_probs)},
+        };
+    }
 
     if (include_usage) {
         // OpenAI API spec for chat.completion.chunks specifies an empty `choices` array for the last chunk when including usage
@@ -992,6 +1006,18 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
+    // a token whose text produced no delta keeps its probs pending until a chunk goes out,
+    // so every generated token appears exactly once in the stream's logprobs
+    if (has_prob_output) {
+        state.pending_probs.push_back(prob_output);
+    }
+    const bool has_chunk = !oaicompat_msg_diffs.empty() || n_decoded == 1 || is_progress;
+    if (has_chunk && !state.pending_probs.empty()) {
+        state.n_probs_sent += state.pending_probs.size();
+        probs_stream = std::move(state.pending_probs);
+        state.pending_probs.clear();
+    }
+
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;
     text_block_started     = state.text_block_started;
@@ -1146,9 +1172,9 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
         auto & last_json = deltas[deltas.size() - 1];
         GGML_ASSERT(last_json.at("choices").size() >= 1);
 
-        if (prob_output.probs.size() > 0) {
+        if (!probs_stream.empty()) {
             last_json.at("choices").at(0)["logprobs"] = json {
-                {"content", completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs)},
+                {"content", completion_token_output::probs_vector_to_json(probs_stream, post_sampling_probs)},
             };
         }
 
