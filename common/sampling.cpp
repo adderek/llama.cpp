@@ -675,7 +675,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first,
+        const common_sampler_on_sample & on_sample) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
@@ -684,6 +685,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (on_sample) {
+            on_sample(i, idxs[i], id);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 
@@ -696,6 +700,9 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
     if (i == draft.size()) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        if (on_sample) {
+            on_sample(i, idxs[i], id);
+        }
 
         common_sampler_accept(gsmpl, id, true);
 

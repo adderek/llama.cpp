@@ -212,7 +212,12 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_str("speculative.type"))
         ->set_desc("Speculative decoding method (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            ctx.params.speculative.types = { common_speculative_type_from_name(data.at("speculative.type").get<std::string>()) };
+            const std::string name = data.at("speculative.type").get<std::string>();
+            const common_speculative_type type = common_speculative_type_from_name(name);
+            if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
+                throw std::runtime_error("Error: unknown speculative.type '" + name + "'");
+            }
+            ctx.params.speculative.types = { type };
         }));
 
     add((new field_num("speculative.ngram_size_n", params.speculative.ngram_simple.size_n))
