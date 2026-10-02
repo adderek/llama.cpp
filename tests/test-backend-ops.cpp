@@ -11079,6 +11079,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
+    // fork: turbo KV caches; batch sizes on both sides of the VEC / f16-pre-dequant switch (8)
+    for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_TURBO4_0 }) {
+        for (ggml_type type_V : { GGML_TYPE_F16, GGML_TYPE_TURBO4_0 }) {
+            if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) continue;
+            for (int nb : { 1, 4, 32, 75, 135 }) {
+                for (int kv : { 256, 512 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_K, type_V));
+                }
+            }
+        }
+    }
+
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
