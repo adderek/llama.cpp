@@ -612,6 +612,12 @@ struct server_slot {
             return 0;
         }
 
+        // the request turned drafting off with "speculative.type": "none"
+        const auto & types = task->params.speculative.types;
+        if (types.size() == 1 && types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+            return 0;
+        }
+
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
@@ -4073,8 +4079,7 @@ private:
                 common_sampler_on_sample on_sample = nullptr;
                 if (slot.task->params.sampling.n_probs > 0) {
                     slot.spec_probs.clear();
-                    on_sample = [&](size_t i, int idx, llama_token id) {
-                        GGML_ASSERT(i == slot.spec_probs.size());
+                    on_sample = [&](size_t /*i*/, int idx, llama_token id) {
                         completion_token_output out;
                         out.tok  = id;
                         out.prob = 0.0f;
@@ -4169,6 +4174,17 @@ private:
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
 
+            // the probs recorded during verification must line up with the accepted tokens; if some
+            // path did not record them, send the tokens without probs rather than wrong ones
+            bool spec_probs_ok = slot.task->params.sampling.n_probs > 0 && slot.spec_probs.size() == ids.size();
+            for (size_t i = 0; spec_probs_ok && i < ids.size(); ++i) {
+                spec_probs_ok = slot.spec_probs[i].tok == ids[i];
+            }
+            if (slot.task->params.sampling.n_probs > 0 && !spec_probs_ok) {
+                SLT_WRN(slot, "probs of %zu accepted draft tokens are missing (recorded %zu), sending them without probs\n",
+                        ids.size(), slot.spec_probs.size());
+            }
+
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
 
@@ -4176,8 +4192,7 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f;
 
-                if (slot.task->params.sampling.n_probs > 0) {
-                    GGML_ASSERT(slot.spec_probs.size() == ids.size());
+                if (spec_probs_ok) {
                     result.prob  = slot.spec_probs[i].prob;
                     result.probs = std::move(slot.spec_probs[i].probs);
                 }

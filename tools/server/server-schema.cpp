@@ -1,6 +1,9 @@
 #include "server-schema.h"
 
 #include "json-schema-to-grammar.h"
+#include "speculative.h"
+
+#include <algorithm>
 
 namespace server_schema {
 
@@ -210,12 +213,19 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
 
 
     add((new field_str("speculative.type"))
-        ->set_desc("Speculative decoding method (for debugging and research purposes)")
+        ->set_desc("Speculative decoding method: \"none\" disables drafting for this request, otherwise one of the types the server was started with (for debugging and research purposes)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             const std::string name = data.at("speculative.type").get<std::string>();
             const common_speculative_type type = common_speculative_type_from_name(name);
             if (type == COMMON_SPECULATIVE_TYPE_COUNT) {
                 throw std::runtime_error("Error: unknown speculative.type '" + name + "'");
+            }
+            // the speculative context is shared by all slots and built at startup, so a request can
+            // only turn drafting off or name a type the server already runs
+            const auto & types = ctx.params.speculative.types;
+            if (type != COMMON_SPECULATIVE_TYPE_NONE && std::find(types.begin(), types.end(), type) == types.end()) {
+                throw std::runtime_error("Error: speculative.type '" + name + "' is not enabled on this server (enabled: " +
+                        common_speculative_type_name_str(types) + ")");
             }
             ctx.params.speculative.types = { type };
         }));
