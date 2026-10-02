@@ -104,7 +104,8 @@ struct task_params {
 struct completion_token_output {
     llama_token tok;
     float prob;
-    std::string text_to_send;
+    std::string text_to_send; // text emitted at this step (stop-word prefixes and incomplete UTF-8 held back)
+    std::string piece;        // the token's own text, reported in logprobs
     struct prob_info {
         llama_token tok;
         std::string txt;

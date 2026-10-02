@@ -1976,6 +1976,7 @@ private:
         stall_mark_activity();
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
+        result.piece = token_str;
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;

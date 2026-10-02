@@ -96,3 +96,45 @@ def test_logprobs_stream_tools_every_token_once(n_predict: int, prefill: str | N
     assert ids == ns_ids  # same tokens, no loss, no duplicates
     if prefill is not None:
         assert n_tool_call_rows > 0
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_logprobs_rows_describe_their_own_token(stream: bool):
+    # each row's "token"/"bytes" is the token's own text, not the text emitted at its step:
+    # a stop word holds back the tokens that form its prefix, which must not shift text
+    # between rows.
+    global server
+    server.start()
+    base = {
+        "max_tokens": 48,
+        "messages": [{"role": "user", "content": "Count from 1 to 30, separated by spaces."}],
+        "temperature": 0.0,
+        "top_k": 1,
+        "logprobs": True,
+        "top_logprobs": 1,
+        "cache_prompt": False,
+    }
+    res = server.make_request("POST", "/chat/completions", data=base)
+    assert res.status_code == 200, res.body
+    text = res.body["choices"][0]["message"]["content"]
+    assert len(text) > 24
+    stop = text[16:20]  # spans a token boundary in practice, so a prefix is held back
+
+    data = base | {"stop": [stop]}
+    if stream:
+        rows, content = [], ""
+        for chunk in server.make_stream_request("POST", "/chat/completions", data=data | {"stream": True}):
+            for choice in chunk["choices"]:
+                content += choice["delta"].get("content") or ""
+                rows += (choice.get("logprobs") or {}).get("content") or []
+    else:
+        res = server.make_request("POST", "/chat/completions", data=data)
+        assert res.status_code == 200, res.body
+        content = res.body["choices"][0]["message"]["content"]
+        rows = res.body["choices"][0]["logprobs"]["content"]
+
+    assert stop not in content
+    assert len(rows) > 0
+    for r in rows:
+        piece = server.make_request("POST", "/detokenize", data={"tokens": [r["id"]]}).body["content"]
+        assert bytes(r["bytes"]) == piece.encode(), (r, piece)
