@@ -2,17 +2,16 @@
 #include "top-k.cuh"
 
 #ifdef GGML_CUDA_USE_CUB
-#   if defined(GGML_USE_HIP)
-#       include <hipcub/hipcub.hpp>
-        namespace cub = hipcub;
-#   else
-#       include <cub/cub.cuh>
-#       if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
-#           define CUB_TOP_K_AVAILABLE
-#           include <cuda/iterator>
+#    include <cub/cub.cuh>
+// DeviceTopK has a race condition before CCCL 3.4.3.
+// https://github.com/NVIDIA/cccl/pull/10627
+#    if (CCCL_MAJOR_VERSION > 3 || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION > 4) || \
+         (CCCL_MAJOR_VERSION == 3 && CCCL_MINOR_VERSION == 4 && CCCL_PATCH_VERSION >= 3))
+#        define CUB_TOP_K_AVAILABLE
+#        include <cuda/iterator>
 using namespace cub;
-#       endif  // CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2
-#   endif
+#    endif  // CCCL >= 3.4.3
 #endif      // GGML_CUDA_USE_CUB
 
 #ifdef CUB_TOP_K_AVAILABLE

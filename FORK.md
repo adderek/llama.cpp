@@ -17,8 +17,8 @@ ggml-org/llama.cpp ──> domvox/llama.cpp-turboquant-hip ──> adderek/llama
 
 - [domvox](https://github.com/domvox/llama.cpp-turboquant-hip) ported TurboQuant KV
   compression to HIP. That fork has since stopped following upstream.
-- This fork took it over, merges **upstream directly** every few weeks (last: 2026-09-28,
-  `4364bf723`), and has grown well beyond it: ~100 commits of its own.
+- This fork took it over, merges **upstream directly** every few weeks (last: 2026-10-08,
+  `dac308739`), and has grown well beyond it: ~100 commits of its own.
 - Branch `master` is the one in use. `domvox-main` only tracks domvox for comparison.
 
 ## What is different from upstream
@@ -122,7 +122,8 @@ cache takes 3.8x less memory.
 
 ### 5. Models and formats
 
-- **K2-Horizon** (MoVA) architecture and converter. `f11f1c137`.
+- **K2-Horizon** (MoVA) arrived from upstream (#29535, 2026-10-06), replacing the fork's own port
+  (`f11f1c137`); the fork only keeps the K2-Horizon-36B tokenizer hash in the converter.
 - Qwen3.8-Flash-Next (`qwen4exp`) arrived from upstream; the fork adds turbo support on its
   QSA path.
 - **TurboQuant weight types `TQ3_1S` / `TQ4_1S`** (WHT-rotated 3- and 4-bit Lloyd-Max, 32
@@ -193,7 +194,7 @@ was found (at 100 it was the only op that went to inf where the CPU stayed finit
 | turbo decode TILE kernel | **tested** | likely | untested | no (HIP only; VEC used) | — | — |
 | kernel thresholds | tuned here | not tuned | not tuned | — | — | — |
 
-Non-turbo fork features (op-offload device choice, `--hugepages`, server watchdog, K2-Horizon,
+Non-turbo fork features (op-offload device choice, `--hugepages`, server watchdog,
 the prompt-cache fix) are not tied to RDNA3.
 
 ## Build

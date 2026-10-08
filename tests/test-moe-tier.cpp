@@ -141,12 +141,11 @@ static int run_child(const std::string & model_path, const std::string & out_pat
 
     const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
     std::mt19937 gen(SEED);
-    llama_batch batch = llama_batch_init(N_TOKENS, 0, 1);
+    common_batch batch(ctx.get());
     for (uint32_t i = 0; i < N_TOKENS; ++i) {
-        common_batch_add(batch, gen() % n_vocab, i, {0}, true);
+        batch.add(gen() % n_vocab, i, 0, true);
     }
-    const int rc = llama_decode(ctx.get(), batch);
-    llama_batch_free(batch);
+    const int rc = llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get());
     if (rc != 0) {
         fprintf(stderr, "decode failed: %d\n", rc);
         return 1;

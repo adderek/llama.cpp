@@ -144,21 +144,19 @@ static attn_outputs run(llama_model * model, const common_params & params, ggml_
 
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
 
-    llama_batch batch = llama_batch_init(n_prompt, 0, 1);
+    common_batch batch(ctx);
     for (uint32_t pos = 0; pos < n_prompt; ++pos) {
-        common_batch_add(batch, (llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, { 0 }, pos + 1 == n_prompt);
+        batch.add((llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, 0, pos + 1 == n_prompt);
     }
-    bool ok = llama_decode(ctx, batch) == 0;
-    llama_batch_free(batch);
+    bool ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) == 0;
 
     // then decode one token at a time: attention with a single query row takes the small-batch
     // kernels (VEC, or TILE reading turbo4 directly), which the prompt above never reaches
     constexpr uint32_t n_decode = 8;
     for (uint32_t pos = n_prompt; ok && pos < n_prompt + n_decode; ++pos) {
-        llama_batch one = llama_batch_init(1, 0, 1);
-        common_batch_add(one, (llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, { 0 }, true);
-        ok = llama_decode(ctx, one) == 0;
-        llama_batch_free(one);
+        common_batch one(ctx);
+        one.add((llama_token) ((7*pos + 1) % (uint32_t) n_vocab), pos, 0, true);
+        ok = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, one.get()) == 0;
     }
     llama_free(ctx);
 
