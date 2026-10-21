@@ -1,38 +1,86 @@
+# adderek/llama.cpp — a TurboQuant fork for AMD RDNA3
+
 > [!NOTE]
 > **This is [adderek/llama.cpp](https://github.com/adderek/llama.cpp), a fork of
 > [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)** tuned for AMD Radeon RX 7900 XTX
 > (gfx1100, RDNA3) on ROCm 7.2.4 / Linux, and **tested only there**. Upstream is merged in
-> regularly. The most important changes:
->
-> **KV cache compression**
-> - **TurboQuant KV cache** (`--cache-type-k/-v turbo2|turbo3|turbo4`): 2.1-4.25 bits per value,
->   3.8x smaller than f16 at turbo4. Works on dense, GQA, sparse (QSA, Qwen3.8-Flash-Next), MLA
->   and DSA attention; K and V may use different types.
-> - **Correctness fixes on top of it**: the QSA path read the cache in the wrong basis and
->   silently answered from the wrong part of the context; GQA models with padded heads crashed.
->
-> **Speed on RDNA3**
-> - **FlashAttention for turbo caches**: 2.6-5.4x faster prefill at 16-64k context; decode up to
->   34% faster, on Ornith-35B faster than an f16 cache at long context.
-> - **MoE models larger than VRAM**: offloaded expert matmuls go to the GPU you choose
->   (`GGML_CUDA_OP_OFFLOAD_DEVICES`), 2x prefill here.
-> - **Models larger than VRAM + RAM** on branch [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier)
->   (not yet in `master`): hot experts on the GPU, cold ones streamed from NVMe with O_DIRECT,
->   2.4 instead of 0.9 tokens/s on a 244 GB 397B model.
->
-> **Server and runtime**
-> - **`--reasoning auto` does not enable thinking** (upstream does); use `--reasoning on`.
-> - Speculative decoding parameters can be set per request; logs show wall-clock time and
->   busy/total slots; a stall watchdog dumps backtraces (`LLAMA_STALL_WATCHDOG_SECS`).
-> - ROCm robustness: fixed a GPU fault on prompt-cache restore, a turbo decode hang and an abort
->   under CUDA-graph capture.
-> - `--hugepages` for model weights; **K2-Horizon** model support.
->
-> **Regression tests** for every fork feature run in ctest (`test-turbo-kv-*`, `test-fattn-turbo4`, ...).
->
-> Details, measurements, environment variables and **which GPUs it can run on** (no turbo on
-> Metal / Vulkan / SYCL; CUDA never built): **[FORK.md](FORK.md)**. Everything below is the
-> upstream README, unchanged.
+> regularly (last: 2026-10-21). Details, measurements, environment variables and **which GPUs it
+> can run on** (no turbo on Metal / Vulkan / SYCL; CUDA never built): **[FORK.md](FORK.md)**.
+> Everything below the upstream title is the upstream README, unchanged.
+
+## Speculative decoding: logprobs you can trust
+
+With speculative decoding, most generated tokens are accepted from a draft rather than sampled
+one by one. A client that reads logprobs (confidence scoring, classifiers, evaluation harnesses,
+agents that retry on low confidence) must get the same numbers for those tokens as without a
+draft, or the probabilities silently change whenever speculation is switched on. The fork has
+done this since 2026-10-02 (`b878d0765`); upstream added its own version on 2026-10-20
+(#27196). The two differ where it matters:
+
+| | upstream | this fork |
+|---|---|---|
+| where draft-token probs come from | read back from the verification batch after acceptance | recorded during verification, right after each position is sampled (`on_sample` callback), no extra decode |
+| `post_sampling_probs: true` | draft tokens get `prob` 1.0 and an empty top list, while tokens sampled normally in the same response get real ones | supported: the sampler's candidates of that step |
+| mismatch between recorded probs and accepted tokens | not checked | checked; the tokens are sent without probs and a warning is logged, never with another token's probs |
+| checkpoint-restore replay | — | verifies again and refills the probs |
+| cost per token with logprobs on | copies all n_vocab logits and sorts them | two vectorized passes, no copy: 1.1 ms → 45 µs per token; decode cost of logprobs 13–16% → 1.4–2.9% (`188aaff93`) |
+| streamed chat with tools + logprobs | rejected with 400 | works; each row rides on the next chunk that goes out (`f79abf326`) |
+| `token` / `bytes` of a row | the text emitted at that step: `""` for a stop-word prefix or half a UTF-8 character, and the next row shows both tokens' text | the token's own piece (`eba1a92ae`) |
+| per-request `speculative.type` | — | `"none"` turns drafting off for that request; an unknown type returns 400 (`3e4738abf`) |
+
+Tested by `tools/server/tests/unit/test_logprobs_speculative.py` (draft on vs off at
+temperature 0: same ids, same top-k, probs within 1e-3) and `test_logprobs_stream_tools.py`;
+upstream's own `test_draft_token_probs` passes on the fork as well.
+
+## What this fork has that upstream does not
+
+**KV cache compression**
+- **TurboQuant KV cache** (`--cache-type-k/-v turbo2|turbo3|turbo4`): 2.1–4.25 bits per value,
+  3.8x smaller than f16 at turbo4. Works on dense, GQA, sparse (QSA, Qwen3.8-Flash-Next), MLA
+  and DSA attention; K and V may use different types.
+- Correctness fixes on top of it: the QSA path read the cache in the wrong basis and silently
+  answered from the wrong part of the context; GQA models with padded heads crashed.
+
+**Speed and precision on RDNA3**
+- **FlashAttention kernels for turbo caches**: 2.6–5.4x faster prefill at 16–64k context; decode
+  up to 34% faster, on Ornith-35B faster than an f16 cache at long context.
+- **Fewer kernel launches per decoded token**: a q8_1 activation cache shared between mat-vecs and
+  fused shared-expert gate, residual add + rms_norm, softplus and GDN beta kernels; on
+  Ornith-35B-A3B 1622 → 1221 kernels per token (the cache alone +7–8% decode), bit-identical
+  output.
+- **f32 accumulation in the MMA FlashAttention kernel**: upstream sums P*V in f16 on RDNA3, which
+  goes 20–67% wrong over 32k positions; perplexity at 32k improves for 0–3.7% of prefill.
+- **No f16 overflow in large matmuls**: Q2_K / Q6_K / IQ2 stay on MMQ instead of an f16-output
+  hipBLAS GEMM, and Q4_1 / Q5_1 / Q8_1 multiply block scales in f32 (a 397B model answered only
+  `/` before).
+
+**MoE models larger than VRAM**
+- `GGML_CUDA_OP_OFFLOAD_DEVICES` picks the GPU that runs the matmuls of experts kept in RAM
+  (upstream takes the first): 2x prefill when the first card sits on a slow PCIe link.
+- **Models larger than VRAM + RAM** (`LLAMA_MOE_HOT`, `LLAMA_MOE_DIRECT`, see
+  `tools/moe-tier/README.md`): experts sorted hottest-first by imatrix counts, hot ones on the
+  GPU, cold ones streamed from NVMe with O_DIRECT into a locked RAM arena: 2.4 instead of
+  0.9 tokens/s on a 244 GB 397B model. Off unless `LLAMA_MOE_HOT` is set.
+
+**Server and runtime**
+- **Speculative decoding with correct logprobs** (above), and speculative parameters settable
+  per request (draft model, n-gram sizes, type).
+- **`--reasoning auto` does not enable thinking** (upstream does); use `--reasoning on`.
+- Logs carry wall-clock time and busy/total slots; a stall watchdog dumps all thread backtraces
+  (`LLAMA_STALL_WATCHDOG_SECS`).
+- `--hugepages`: model weights on 2 MiB hugetlb pages.
+
+**Robustness on ROCm**
+- Fixed a GPU memory fault on prompt-cache restore, a turbo4 decode hang (cross-stream race) and
+  an abort under CUDA-graph capture.
+
+**Models and formats**
+- TurboQuant weight types `TQ3_1S` / `TQ4_1S` (load and run; inherited from domvox, untested).
+- The multimodal loader fails cleanly when the vision encoder's buffers do not fit, instead of
+  crashing on the first image.
+
+**Regression tests** for every fork feature run in ctest (`test-turbo-kv-*`, `test-fattn-turbo4`,
+`test-moe-tier`, `test-mmvq-src1-cache`, ...), each in its own file.
 
 # llama.cpp
 

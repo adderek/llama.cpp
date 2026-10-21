@@ -89,9 +89,8 @@ cache takes 3.8x less memory.
   in RAM. Upstream takes the first device, which on this box is the card behind a PCIe Gen3 x4
   chipset link; pointing it at the x16 card doubled prefill of Qwen3.8-Flash-Next
   (305 → 600 tokens/s). `dfa85e69b`.
-- **Models larger than VRAM + RAM, streamed from NVMe** — branch
-  [`moe-tier`](https://github.com/adderek/llama.cpp/tree/moe-tier), **not in `master`** yet
-  (it is based on `master` before the 2026-09-28 upstream merge):
+- **Models larger than VRAM + RAM, streamed from NVMe** — in `master` since 2026-10-01
+  (`5d2e5db5d`), off unless `LLAMA_MOE_HOT` is set:
   - experts are permuted hottest-first by the routing counts in an imatrix
     (`tools/moe-tier/moe-tier.py`), then each fused expert tensor is split at load time:
     the hottest `LLAMA_MOE_HOT` experts per layer stay on the GPU, the rest go to RAM;
@@ -105,7 +104,7 @@ cache takes 3.8x less memory.
   0.9 tokens/s through mmap, **2.4 tokens/s with the O_DIRECT arena**; the same model at
   Q2_K, which fits, runs at 5.4. On a model that fits in VRAM + RAM, per-expert placement
   gave +30% decode over `--n-cpu-moe` at 25% of the experts in VRAM (Ornith-35B).
-  Environment variables and usage: `tools/moe-tier/README.md` on that branch.
+  Environment variables and usage: `tools/moe-tier/README.md`.
 
 ### 4. Server behaviour that differs from upstream
 
@@ -116,6 +115,10 @@ cache takes 3.8x less memory.
   presets between the two.
 - **Speculative decoding parameters can be set per request** (draft-model parameters, n-gram
   sizes and the speculation type); upstream has this disabled. `901f0234f`.
+- **Logprobs for tokens accepted from a speculative draft** match those of plain decoding,
+  including `post_sampling_probs`, streamed chat with tools, and a cheap top-k path (1.1 ms →
+  45 µs per token). Upstream's later version (#27196) and the differences: README,
+  "Speculative decoding: logprobs you can trust". `b878d0765`, `188aaff93`, `f79abf326`.
 - Log lines carry **wall-clock time** (`hh:mm:ss.mmm`) instead of time since start, and slot
   lines show **busy/total slots** (`| 3/4 |`). `6b8a014a9`.
 - Stall watchdog and the prompt-cache fault fix: see section 6 below.
