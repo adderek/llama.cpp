@@ -17,8 +17,8 @@ ggml-org/llama.cpp ──> domvox/llama.cpp-turboquant-hip ──> adderek/llama
 
 - [domvox](https://github.com/domvox/llama.cpp-turboquant-hip) ported TurboQuant KV
   compression to HIP. That fork has since stopped following upstream.
-- This fork took it over, merges **upstream directly** every few weeks (last: 2026-10-08,
-  `dac308739`), and has grown well beyond it: ~100 commits of its own.
+- This fork took it over, merges **upstream directly** every few weeks (last: 2026-10-21,
+  `7775ffb7e`), and has grown well beyond it: ~100 commits of its own.
 - Branch `master` is the one in use. `domvox-main` only tracks domvox for comparison.
 
 ## What is different from upstream
