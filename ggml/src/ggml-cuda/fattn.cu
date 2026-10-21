@@ -873,12 +873,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifdef GGML_USE_HIP
-    // The tile kernels for D >= 576 exceed the HIP local memory limit and are not compiled,
-    // see ggml_cuda_flash_attn_ext_tile - those head sizes must therefore not select TILE.
-    // Fall back to the non-FlashAttention path rather than aborting if MMA is also unavailable.
-    if (Q->ne[0] >= 576) {
-        // MMA also needs LDS for a D-sized Q tile, which only CDNA and RDNA4 have enough of here;
-        // on RDNA3 both kernels are out, so report the op as unsupported instead of failing a launch.
+    // The D=640 tile kernels exceed the HIP local memory limit and are not compiled, see
+    // ggml_cuda_flash_attn_ext_tile. MMA needs LDS for a D-sized Q tile, which only CDNA and RDNA4
+    // have enough of; elsewhere report the op as unsupported instead of failing a launch.
+    if (Q->ne[0] == 640) {
         if (amd_mfma_available(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
             return BEST_FATTN_KERNEL_MMA_F16;
         }

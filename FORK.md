@@ -188,6 +188,12 @@ minimum times the activation sum overflowed in the mat-vec path. They multiply i
 `GGML_TEST_INPUT_SCALE=N` widens every input of `test-backend-ops` by N, which is how that one
 was found (at 100 it was the only op that went to inf where the CPU stayed finite).
 
+The domvox port excluded the D=576 and D=640 FlashAttention tile kernels from HIP builds as over
+the 64 KiB LDS limit. Only the fork's D=640 variants (padded turbo K for GLM-4.7 Flash) are; the
+D=576 kernels compile and are what upstream uses on RDNA3. With both excluded, every MLA
+FlashAttention (DeepSeek, GLM-4.7 Flash) on RDNA3 was "not supported" and left the GPU; D=576 now
+runs on the tile kernel, D=640 is still excluded. Not measured on a real MLA model (none on this box).
+
 ## What runs where
 
 | | RX 7900 XTX (gfx1100) | other RDNA3 (gfx1101/1102) | RDNA4 / CDNA | NVIDIA (CUDA) | CPU | Metal / Vulkan / SYCL |
@@ -258,6 +264,7 @@ Registered in ctest; each lives in its own file so upstream merges do not confli
 | `test-add-unary-mul-fusion` | fused `op(x + bias) * g` gives the bits of the unfused kernels |
 | `test-gdn-beta-sigmoid-fusion` | GATED_DELTA_NET applying `sigmoid(beta)` itself gives the bits of the unfused kernels, snapshot-copy fusion included |
 | `test-fattn-long-kv` | FlashAttention evenly spread over 32k KV positions returns the value, not inf or a 20-67% error: the RDNA3 MMA kernel used to sum P*V in f16 |
+| `test-fattn-mla` | FlashAttention with the DeepSeek MLA head sizes (K 576, V 512, V a view of K) is supported on the GPU and returns the exact mean of V for uniform weights |
 | `test-mul-mat-f16-range` | mat-muls whose results pass the f16 range stay finite: Q6_K / Q2_K / F16 at large batch (the RDNA3 hipBLAS path wrote f16), Q4_1 / Q5_1 at one row (half2 block-scale product) |
 | `test-moe-tier` | a tiny qwen3moe split into hot and cold experts, through the arena and windowed paths and `moe-tier.py permute`, gives the logits of the untiered model (bit-identical on CPU, NMSE < 1e-12 on each GPU and both) |
 

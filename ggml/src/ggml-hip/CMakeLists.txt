@@ -64,8 +64,9 @@ list(APPEND GGML_HEADERS_ROCM "../../include/ggml-cuda.h")
 
 file(GLOB   GGML_SOURCES_ROCM "../ggml-cuda/*.cu")
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-tile*.cu")
-# Exclude D>=576 tile kernels: exceed HIP local memory limit (67584 > 65536)
-list(FILTER SRCS EXCLUDE REGEX "dkq(576|640)")
+# Exclude the D=640 tile kernels (fork: padded turbo K for GLM-4.7 Flash): their 32-column
+# variants need 67584 bytes of LDS, over the 65536 limit. D=576 (DeepSeek MLA) fits.
+list(FILTER SRCS EXCLUDE REGEX "dkq640")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
 file(GLOB   SRCS "../ggml-cuda/template-instances/fattn-mma*.cu")
 list(APPEND GGML_SOURCES_ROCM ${SRCS})
