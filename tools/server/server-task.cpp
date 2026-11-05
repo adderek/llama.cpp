@@ -1538,6 +1538,16 @@ json server_task_result_rerank::to_json() {
 //
 // server_task_result_tts
 //
+json server_task_result_realtime::to_json() {
+    return json {
+        {"text",          text},
+        {"n_samples",     audio.size()},
+        {"response_done", response_done},
+        {"cancelled",     cancelled},
+        {"n_decoded",     n_decoded},
+    };
+}
+
 json server_task_result_tts::to_json() {
     return json {
         {"sample_rate", sample_rate},
@@ -1770,7 +1780,7 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-void server_prompt_cache::retire(std::vector<uint8_t> & data) {
+void server_prompt_cache::retire(common_state_data & data) {
     if (data.empty()) {
         return;
     }
@@ -1799,7 +1809,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     // calculate checkpoints size to see if it will fit with the prompt
     size_t checkpoints_size = 0;
     for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+        checkpoints_size += ckpt->size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1834,8 +1844,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_data state_data_tgt;
+    common_state_data state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {

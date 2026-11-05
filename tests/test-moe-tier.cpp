@@ -17,6 +17,7 @@
 
 #include "../src/llama-arch.h"
 #include "../src/llama-model-saver.h"
+#include "../src/llama-ext.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -51,7 +52,13 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 
 static bool write_model(const std::string & path) {
     gguf_context_ptr gguf_ctx(gguf_init_empty());
-    llama_model_saver ms(LLM_ARCH_QWEN3MOE, gguf_ctx.get());
+    // writes arch-resolved keys, as llama_model_saver used to for a bare gguf context
+    struct {
+        gguf_context * ctx;
+        void add_kv(llm_kv key, uint32_t     v) { gguf_set_val_u32(ctx, llama_arch_kv_name(LLM_ARCH_QWEN3MOE, key).c_str(), v); }
+        void add_kv(llm_kv key, float        v) { gguf_set_val_f32(ctx, llama_arch_kv_name(LLM_ARCH_QWEN3MOE, key).c_str(), v); }
+        void add_kv(llm_kv key, const char * v) { gguf_set_val_str(ctx, llama_arch_kv_name(LLM_ARCH_QWEN3MOE, key).c_str(), v); }
+    } ms { gguf_ctx.get() };
 
     ms.add_kv(LLM_KV_GENERAL_ARCHITECTURE,         llm_arch_name(LLM_ARCH_QWEN3MOE));
     ms.add_kv(LLM_KV_VOCAB_SIZE,                   uint32_t(128));
