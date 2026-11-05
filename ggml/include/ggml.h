@@ -432,15 +432,16 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_TURBO3_0 = 43, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO4_0 = 44, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
-        GGML_TYPE_TURBO2_0 = 45, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
-        GGML_TYPE_TQ3_1S  = 46, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
-        GGML_TYPE_TQ4_1S  = 47, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
-        // fork: upstream numbers F8_E4M3 43, which the TurboQuant types took first;
-        // GGUF files written by upstream with F8_E4M3 tensors do not load here (see gguf.cpp)
-        GGML_TYPE_F8_E4M3 = 48,
-        GGML_TYPE_COUNT   = 49,
+        GGML_TYPE_F8_E4M3 = 43,
+        // fork: TurboQuant types live in a reserved range well above upstream's, so upstream's
+        // new types keep upstream's numbers and GGUF files stay interchangeable. Ids 44-63 are
+        // left for upstream; a merge that reaches 64 must move this range up.
+        GGML_TYPE_TURBO3_0 = 64, // TurboQuant 3-bit KV cache: 2-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO4_0 = 65, // TurboQuant 4-bit KV cache: 3-bit PolarQuant + 1-bit QJL
+        GGML_TYPE_TURBO2_0 = 66, // TurboQuant 2-bit KV cache: 2-bit PolarQuant (no QJL)
+        GGML_TYPE_TQ3_1S  = 67, // TurboQuant 3-bit weight: WHT-rotated 8-level Lloyd-Max, block_size=32
+        GGML_TYPE_TQ4_1S  = 68, // TurboQuant 4-bit weight: WHT-rotated 16-level Lloyd-Max, block_size=32
+        GGML_TYPE_COUNT   = 69,
     };
 
     // [TAG_GGML_PREC]

@@ -750,12 +750,12 @@ llama_model_loader::llama_model_loader(
             enum ggml_type type = tensor->type;
 
             // fork: TURBO2/3/4 are KV-cache-only types and are never written as weights. A weight of
-            // one of them comes from an upstream file using upstream numbering (43 = F8_E4M3 there,
-            // 48 here); refuse it rather than misread the data.
+            // one of them means upstream has numbered a new type into the fork's reserved range
+            // (see ggml.h); refuse it rather than misread the data.
             if (type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0 || type == GGML_TYPE_TURBO2_0) {
                 throw std::runtime_error(format("tensor '%s' has ggml type %d (%s), which is KV-cache-only in this fork; "
-                    "the file was probably written by upstream llama.cpp with F8_E4M3 tensors (upstream type 43, "
-                    "this fork numbers it 48)", ggml_get_name(tensor), (int) type, ggml_type_name(type)));
+                    "the file probably uses a newer upstream type that collides with the fork's reserved type range",
+                    ggml_get_name(tensor), (int) type, ggml_type_name(type)));
             }
 
             n_type[type]++;

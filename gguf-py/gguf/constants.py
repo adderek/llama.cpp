@@ -6758,7 +6758,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
-    F8_E4M3 = 48  # fork: upstream uses 43, taken by TURBO3_0 in this fork
+    F8_E4M3 = 43
 
 
 class ExpertGatingFuncType(IntEnum):
