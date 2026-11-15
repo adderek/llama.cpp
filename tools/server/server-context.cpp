@@ -1838,12 +1838,13 @@ private:
                     common_chat_format_example(chat_templates.get(), params_base.use_jinja, params_base.default_template_kwargs).c_str());
 
                 // thinking is enabled if:
-                // 1. It's explicitly enabled via --reasoning enable (== 1)
+                // 1. It's not explicitly disabled via --reasoning off
                 // 2. The chat template supports it
-                // Auto mode (-1) does NOT enable thinking - Qwen3.5/3.6 with enable_thinking=true
-                // routes ALL output to reasoning_content, leaving content empty for agents.
+                // (99792a7cd made auto mean off, for a Qwen empty-content problem that no
+                // longer reproduces; reverted so auto matches --help. Set --reasoning
+                // on|off explicitly in configs.)
                 const bool template_supports_thinking = params_base.use_jinja && common_chat_templates_support_enable_thinking(chat_templates.get());
-                enable_thinking = params_base.enable_reasoning == 1 && template_supports_thinking;
+                enable_thinking = params_base.enable_reasoning != 0 && template_supports_thinking;
                 SRV_TRC("%s: chat template, thinking = %d\n", __func__, enable_thinking);
             } catch (const std::exception & e) {
                 SRV_ERR("%s: chat template parsing error: %s\n", __func__, e.what());
