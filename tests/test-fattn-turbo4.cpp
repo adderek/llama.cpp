@@ -33,7 +33,7 @@ static std::vector<float> run(ggml_backend_t backend, const fa_case & c,
     ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_TURBO4_0, c.D, c.n_kv, c.n_head_kv,       1);
     ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16,      c.n_kv, c.n_q, 1,               1);
     ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) c.D), 0.0f, 0.0f);
-    ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
+    ggml_prec_set_acc(out, GGML_PREC_F32);
 
     ggml_cgraph * gf = ggml_new_graph(ctx);
     ggml_build_forward_expand(gf, out);
